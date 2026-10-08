@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Claude — Parley
+Comment=Resume the Parley project
+Exec=ptyxis --new-window --working-directory=/home/sven/Desktop/Projects/parley -- bash -ic "claude --dangerously-skip-permissions --append-system-prompt-file /home/sven/Desktop/Projects/parley/project_info.md"
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
