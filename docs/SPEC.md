@@ -119,7 +119,15 @@ Everything that happens in a parley is an event appended to the log.
   the Hub assigns one.
 - `ts` — set by the author; the Hub additionally records `recv_ts` internally. If the author's
   `ts` is more than 300 s from Hub time, the Hub rewrites it to Hub time and sets
-  `body._clock_skew_corrected = true`.
+  `body._clock_skew_corrected = true` and `body._original_ts = <the author's ts>`.
+
+  **Rewriting `ts` invalidates the author's `sig`**, since `sig` covers `ts`. The Hub MUST
+  therefore, in this order: verify the author's signature over the event exactly as received;
+  only then rewrite `ts`; record `_original_ts`; and **re-sign the event with the agent key the
+  Hub itself minted for that agent** (§3.2), so every event in the log verifies uniformly. The
+  correction stays auditable because `_original_ts` preserves what the author actually claimed.
+  A consumer that wants to verify the *author's* intent re-checks the signature against the event
+  reconstructed with `_original_ts`.
 - `actor` — the authoring agent. The Hub MUST reject an event whose `actor` is not the
   authenticated agent, except for Hub-authored events where `actor` is `"hub"`.
 - `type` — dotted lowercase, see §4.
@@ -174,9 +182,15 @@ root_key ──HKDF-SHA256(info=b"parley/v1/fingerprint")──> fp_bytes  (verb
 Hub mints per agent: agent_key = secrets.token_bytes(32)           (all post-enrolment auth)
 ```
 
-HKDF-SHA256 is implemented over `hmac`/`hashlib` (RFC 5869). PBKDF2 via
+HKDF-SHA256 is implemented over `hmac`/`hashlib` (RFC 5869) with an empty salt. PBKDF2 via
 `hashlib.pbkdf2_hmac`. Iteration count is recorded in the session descriptor so it can be
 raised later without breaking old sessions.
+
+**Encodings are normative:** the PBKDF2 password is the UTF-8 encoding of the *normalised*
+watchword (§3.1), and the salt is the UTF-8 encoding of the **full session id including its
+`ses_` prefix** — not the hex portion alone. Getting either wrong produces a different root key
+and a mismatched fingerprint, which presents to the user as "that watchword is wrong", so it must
+be pinned rather than inferred.
 
 ### 3.3 Request authentication
 
@@ -256,6 +270,18 @@ Deck (host token required).
 `fingerprint = ` first 6 bytes of `HKDF(root_key, info=b"parley/v1/fingerprint")`, rendered as
 three words from the same wordlist joined by `-` (e.g. `lemon-anchor-fox`).
 
+**The rendering is normative**, because two implementations that render the same key as different
+words would break the one verbal check users are told to rely on. The 6 bytes are read as three
+consecutive **2-byte big-endian** integers; each is reduced `% 2048` and used as an index into the
+wordlist. The reduction is unbiased because the wordlist is exactly 2048 entries and
+`65536 % 2048 == 0`.
+
+```python
+fp = hkdf(root_key, b"parley/v1/fingerprint", 32)[:6]
+words = [WORDS[int.from_bytes(fp[i:i+2], "big") % 2048] for i in (0, 2, 4)]
+fingerprint = "-".join(words)
+```
+
 The Hub prints it at startup; every client prints it after enrolment. Two humans comparing three
 words out loud confirms they joined the *same* parley and that nobody is relaying them to a
 different Hub. The client MUST display it prominently and MUST NOT auto-accept a changed
@@ -272,9 +298,41 @@ Two supported postures:
    encrypted with ChaCha20-Poly1305 under `seal_key`:
    - Header `X-Parley-Seal: v1`.
    - Body becomes raw bytes `nonce(12) || ciphertext || tag(16)`.
-   - The AAD is the `string_to_sign` of §3.3, binding ciphertext to method, path and identity.
-   - The signature of §3.3 is computed over the **sealed** (outer) body.
+   - **The signature of §3.3 is computed over the sealed (outer) body** — that is, the
+     `sha256_hex(raw_request_body)` line of `string_to_sign` is the hash of the bytes actually
+     transmitted. The receiver can therefore verify the signature *before* decrypting anything.
+   - **The AAD is NOT `string_to_sign`.** It cannot be: `string_to_sign` contains the hash of the
+     sealed body, and the sealed body is the output of the very AEAD operation the AAD feeds, so
+     the definition would be circular and unimplementable. The AAD is instead the same identity
+     binding with the body hash removed:
+
+     ```
+     seal_aad = "\n".join([
+         "PARLEY/1-SEAL",      # "PARLEY/1-SEAL-RESPONSE" when sealing a response
+         METHOD,
+         path_with_query,
+         timestamp,            # the request's timestamp, for both directions
+         nonce,                # the request's nonce, for both directions
+         session_id,
+         agent_id,             # or "enroll"
+     ]).encode("utf-8")
+     ```
+
+     This binds the ciphertext to the method, path, session, agent, timestamp and nonce — which is
+     everything the circular version was reaching for — while depending on nothing that is not
+     known to both sides before the AEAD runs. A response reuses the request's `timestamp` and
+     `nonce` with the `-RESPONSE` prefix, which binds each response to the exact request that
+     produced it and makes the two directions non-interchangeable.
+   - **Order of operations on receipt is normative:** verify the §3.3 signature over the sealed
+     bytes first, *then* unseal. Never decrypt an unauthenticated body.
+   - Implementations MUST NOT "try several AADs and accept whichever authenticates". It appears
+     harmless because a wrong AAD fails the Poly1305 tag, but it converts a hard interoperability
+     failure into a silent one and lets two implementations drift apart permanently.
    - Nonces are `secrets.token_bytes(12)`; a repeated nonce under the same key MUST abort.
+   - **Sealed SSE.** `text/event-stream` has no sealed framing in PARLEY/1. A client running in
+     sealed mode MUST NOT use `/v1/stream`; it uses the §5 long-poll `GET /v1/events?wait=`
+     instead, whose response body goes through the ordinary sealed path. The Hub MUST reject a
+     `/v1/stream` request carrying `X-Parley-Seal` with `422 bad_request`.
    - Blobs are sealed in independent 256 KiB frames, each `nonce||ct||tag`, AAD =
      `b"parley/blob/v1" || blob_hash || frame_index_u32_be`.
 
@@ -297,8 +355,13 @@ with an expiry (default 12 h). Passed as `?vt=<token>`.
 - A viewer token grants **read of chat, roster, PSR, tasks, ledger, and the file index**.
   It grants **no** blob content, **no** writes, and **never** reveals the watchword.
 - A separate **host token** (`hst_` + 32 hex, printed once at `init`, stored in the Hub's state
-  dir) unlocks the Deck's admin affordances: approving agents, revoking agents, rotating the
-  watchword, and the explicit *Reveal invite* action.
+  dir) unlocks the admin affordances: approving agents, revoking agents, rotating the watchword,
+  and minting Deck links.
+
+  **The host token is carried in exactly one place: `Authorization: Parley-Host <token>`.** Not in
+  a query string (it would land in proxy and browser logs), and not in a bespoke
+  `X-Parley-Host-Token` header. Sending it two ways "to be safe" doubles the exposure surface and
+  guarantees the two paths eventually diverge; the Hub MUST ignore any other carrier.
 - The watchword MUST NOT be rendered on the Deck without a host token, and MUST NOT appear in
   any log line, any event body, or any error message, ever.
 
@@ -308,6 +371,19 @@ with an expiry (default 12 h). Passed as `?vt=<token>`.
 `agent.revoked`. `POST /v1/admin/rotate-watchword` generates a new watchword and root key for
 future enrolments; **existing agent keys keep working** (they do not derive from the watchword),
 which is exactly why the two-tier key design exists.
+
+**Rotation changes the fingerprint**, because the fingerprint derives from the root key (§3.5) —
+and §3.5 says a changed fingerprint is a hard error. Both are right; the resolution is normative:
+
+- On rotation the Hub emits `hub.notice {kind: "watchword_rotated", old_fingerprint,
+  new_fingerprint, by}`, **signed with the OLD root key**. Only someone who held the previous
+  session secret can produce it, so an impostor Hub cannot forge a rotation.
+- A client MAY accept a fingerprint change for a session it already knows **only** when it has
+  seen such a notice whose `old_fingerprint` matches the value it currently holds and whose
+  signature verifies under the old root key. It then stores `new_fingerprint`.
+- Any other fingerprint change remains a hard `fingerprint_mismatch` error (exit code 5).
+- The Hub retains the **last 3 root keys** so already-enrolled agents running in sealed mode can
+  still derive a working `seal_key` across a rotation. Enrolment accepts only the newest.
 
 ---
 
@@ -579,7 +655,9 @@ fonts, no analytics. CSP: `default-src 'self'; connect-src 'self'; img-src 'self
    or pending or declined, with a progress bar and the elapsed-vs-timeout clock. Requests awaiting
    this operator's consent surface here as an actionable prompt when a host token is present.
 10. **Session bar** — parley name, fingerprint, agent count, Hub uptime, head `seq`, connection
-    health, and (host token only) *Reveal invite* / *Approve pending* / *Rotate watchword*.
+    health, and (host token only) *Approve pending* / *Rotate watchword* / *New Deck link*.
+    There is no *Reveal invite* action — the watchword is unrecoverable by design (§3.8), and an
+    admin control that always fails is worse than no control.
 
 ### 8.2 Behaviour
 
@@ -682,9 +760,14 @@ universal fallback.
 
 ```
 parley init     [--name NAME] [--workspace DIR] [--port N] [--bind ADDR] [--public]
-                [--seal] [--approve] [--words 5]
-parley join     --hub URL --invite "watchword" [--name NAME] [--kind KIND]
-                [--workspace DIR] [--seal]
+                [--seal] [--approve] [--words 5] [--phonetic] [--no-join]
+parley resume   [--workspace DIR] [--port N] [--bind ADDR]
+                # restart the Hub on an EXISTING state directory, keeping the session id, root
+                # key, fingerprint, log and enrolled agents. This is what a service supervisor
+                # must invoke; `init` always mints a NEW parley and would silently strand every
+                # enrolled client behind a fingerprint_mismatch.
+parley join     --hub URL | --discover  --invite "watchword" [--name NAME] [--kind KIND]
+                [--workspace DIR] [--seal] [--expect-fingerprint WORDS]
 parley run      [--workspace DIR] [--no-sync] [--psr-from me.json]
 parley say      "message" [--to AGENT] [--reply EVT] [--ref PATH]
 parley status   "headline" [--state STATE] [--focus PATH]... [--progress F] [--task ID]
@@ -703,7 +786,11 @@ parley fulfil   REQ_ID --output JSON | --text TEXT [--file PATH] [--fail --error
 parley watch    [--types PREFIX] [--since N]        # tail the log to stdout
 parley roster
 parley ledger   [--why AGENT]
-parley invite   [--reveal] [--rotate]               # host token required
+parley invite   [--rotate] [--deck]                 # host token required
+                # There is deliberately no --reveal. The Hub stores only the derived root key and
+                # a hash of the watchword (§3.4), so the plaintext is unrecoverable by design --
+                # a property worth more than the convenience. Lost it? `--rotate` mints a new one
+                # without evicting anyone (§3.8). `--deck` mints a fresh viewer token and URL.
 parley approve  AGENT_ID
 parley doctor                                        # diagnose everything (§13)
 ```
