@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t d">
+  <title id="t">Parley</title>
+  <desc id="d">The small cut of the Parley mark, for 32px and below: the same signal hoist with
+  the Blue Peter's centre dropped, because at favicon size that detail turns to mush and costs
+  more legibility than the meaning is worth.</desc>
+  <defs>
+    <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d8a90"/>
+      <stop offset="1" stop-color="#075458"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#field)"/>
+  <path d="M142 86 V426" stroke="#fff" stroke-width="26" stroke-linecap="round"/>
+  <path d="M142 132 H390 L346 194 L390 256 H142 Z" fill="#fff"/>
+  <path d="M142 300 H330 L292 350 L330 400 H142 Z" fill="#fff"/>
+</svg>

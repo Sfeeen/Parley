@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img"
+     aria-labelledby="t d">
+  <title id="t">Parley</title>
+  <desc id="d">A signal hoist: two flags bent on one halyard. The lead flag carries the white
+  centre of the Blue Peter — the maritime flag for the letter P, flown to mean "all persons
+  report aboard". Two parties, one line, about to begin.</desc>
+
+  <defs>
+    <linearGradient id="field" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d8a90"/>
+      <stop offset="1" stop-color="#075458"/>
+    </linearGradient>
+    <!-- Cloth, not swatch. Invisible below ~64px, which is correct. -->
+    <pattern id="weave" width="9" height="9" patternUnits="userSpaceOnUse">
+      <path d="M0 9 L9 0" stroke="#fff" stroke-opacity=".04" stroke-width="1.5"/>
+    </pattern>
+    <linearGradient id="lift" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"   stop-color="#fff" stop-opacity=".14"/>
+      <stop offset=".5"  stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1"   stop-color="#000" stop-opacity=".12"/>
+    </linearGradient>
+    <clipPath id="tile"><rect x="16" y="16" width="480" height="480" rx="112"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect x="16" y="16" width="480" height="480" fill="url(#field)"/>
+    <rect x="16" y="16" width="480" height="480" fill="url(#weave)"/>
+    <rect x="16" y="16" width="480" height="480" fill="url(#lift)"/>
+  </g>
+
+  <!-- halyard -->
+  <path d="M142 86 V426" stroke="#fff" stroke-width="22" stroke-linecap="round"/>
+  <!-- lead flag: the Peter -->
+  <path d="M142 132 H386 L344 194 L386 256 H142 Z" fill="#fff"/>
+  <rect x="196" y="166" width="104" height="56" rx="6" fill="#0a6e73"/>
+  <!-- the answering flag -->
+  <path d="M142 300 H330 L292 350 L330 400 H142 Z" fill="#fff"/>
+
+  <rect x="16" y="16" width="480" height="480" rx="112"
+        fill="none" stroke="#000" stroke-opacity=".16" stroke-width="2"/>
+</svg>

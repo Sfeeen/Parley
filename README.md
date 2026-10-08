@@ -1,4 +1,20 @@
-# Parley
+<p align="center">
+  <img src="assets/icon.svg" width="112" height="112" alt="">
+</p>
+
+<h1 align="center">Parley</h1>
+
+<p align="center"><em>A protocol for agents who need to work together.</em></p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/protocol-PARLEY%2F1-0a6e73" alt="PARLEY/1">
+  <img src="https://img.shields.io/badge/python-3.9%2B-0a6e73" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/dependencies-none-0a6e73" alt="No dependencies">
+  <img src="https://img.shields.io/badge/tests-993%20passing-0a6e73" alt="993 tests passing">
+  <img src="https://img.shields.io/badge/licence-MIT-0a6e73" alt="MIT licence">
+</p>
+
+---
 
 **Parley lets two or more autonomous agents — any kind, any OS — collaborate on one project.**
 Point an agent at this repository, give it a spoken watchword, and within a minute it shares a
@@ -7,6 +23,13 @@ webpage showing who is doing what. It is a protocol (`PARLEY/1`) plus a referenc
 in pure Python 3 standard library — no dependencies, no install, no accounts, no git required.
 
 Status: **v1 — expect sharp edges.** See [Limitations](#limitations) before you rely on it.
+
+![The Deck — Parley's live visualisation of a session](assets/deck-dark.png)
+
+<sub><b>The Deck.</b> Served by the Hub itself, so "one participant runs a webpage" needs no extra
+setup. Every agent's standing report, what each is blocked on, the shared chat, the knowledge
+ledger, and anything that needs a human — all live. Shown here on the bundled fixture, which is
+also how you can try it with no Hub running: open <code>parley/hub/deck/index.html?fixture=1</code>.</sub>
 
 ---
 
@@ -115,7 +138,7 @@ HTTP is fine, because every request is HMAC-signed and replay-protected; see
 A single self-contained page at `/`. No CDN, no web fonts, no analytics, no external request of
 any kind. Light and dark theme, works at 1280 px and on a phone.
 
-Eight panels:
+Ten panels:
 
 | Panel | What you see |
 |---|---|
@@ -126,10 +149,23 @@ Eight panels:
 | **Activity timeline** | A swimlane per agent across time, coloured by their PSR state, with file-sync and conflict markers punched in. |
 | **Workspace** | Recent file writes with their author, conflict badges, and a heat-map of which files are getting attention. |
 | **Tasks** | A board grouped by status, each card showing who claimed it. |
-| **Session bar** | Parley name, fingerprint, agent count, Hub uptime, head sequence number, connection health — and, if you hold the host token, *Reveal invite*, *Approve pending* and *Rotate watchword*. |
+| **Capabilities** | What each agent can do for the others. Capabilities only one agent can perform are highlighted, and dangerous ones are marked. |
+| **Requests in flight** | Who asked whom for what, how far along it is, and how long before it expires. Anything waiting on *your* approval surfaces at the top of the page. |
+| **Session bar** | Parley name, fingerprint, agent count, Hub uptime, head sequence number, connection health — and, if you hold the host token, *Approve pending*, *Rotate watchword* and *New Deck link*. There is no *Reveal invite*: the watchword is unrecoverable by design. |
 
 The page survives the Hub restarting without a manual refresh, and degrades to long-polling if
 `EventSource` fails twice.
+
+<table>
+<tr>
+<td width="50%"><img src="assets/deck-light.png" alt="The Deck in its light theme"></td>
+<td width="50%"><img src="assets/deck-mobile.png" alt="The Deck on a 390px phone viewport"></td>
+</tr>
+<tr>
+<td align="center"><sub>Light theme — both are designed, not one inverted.</sub></td>
+<td align="center"><sub>390&nbsp;px. The chat moves below the panels.</sub></td>
+</tr>
+</table>
 
 ---
 
@@ -163,6 +199,21 @@ person sitting at it who will go and photograph something.
 Without a way to say so, each of those is invisible: the agent writing the report does not know
 that the agent next to it can read the drive, so it guesses, or it stops. The Exchange is the part
 of the protocol that fixes that.
+
+![The Capabilities panel: what each agent can do for the others](assets/deck-capabilities.png)
+
+<sub>Capabilities marked <b>only this agent</b> are the reason the parley is worth more than the
+same agents working alone. <code>dangerous</code> means a human approves every single call and no
+policy file can override that. Note the agent that declared <code>safety: saafe</code> — the Deck
+renders an unrecognised value verbatim and treats it as unsafe, rather than quietly correcting
+what a provider claimed.</sub>
+
+![Requests in flight: who asked whom for what](assets/deck-requests.png)
+
+<sub>Delegation, live. One request is waiting on a human and has gone overdue; one was accepted
+and is running against its clock; one was offered to whoever can take it; one is a free-form
+instruction rather than a registered capability. Every one of them is a signed, attributable
+event in the log.</sub>
 
 **Announce what you can do:**
 
@@ -287,6 +338,7 @@ Examples: [`examples/claude-code/`](examples/claude-code/) (drop-in instructions
 
 ```
 AGENTS.md              the agent-facing onboarding procedure
+assets/                the mark, favicons, social preview, Deck screenshots
 docs/                  spec, protocol guide, deployment, troubleshooting
 parley/                the reference implementation (stdlib only)
   crypto.py            watchword, key hierarchy, signing, sealing
