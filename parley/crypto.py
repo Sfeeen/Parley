@@ -6,6 +6,9 @@ interoperability and must not drift:
 * :func:`string_to_sign` -- the Hub and every client build these bytes
   independently and compare the resulting MAC. One extra newline and nobody can
   talk to anybody.
+* :func:`seal_aad` -- the sealed-mode binding string of SPEC 3.6. Both ends
+  build it independently and the Poly1305 tag is the only thing that notices a
+  disagreement, so there is exactly one implementation of it, here.
 * :func:`hkdf` and :func:`derive_root_key` -- the whole key hierarchy of
   SPEC 3.2 hangs off them.
 * the ChaCha20-Poly1305 construction -- a sealed body produced by the pure
@@ -49,6 +52,7 @@ __all__ = [
     "BACKEND", "normalise_watchword", "generate_watchword", "derive_root_key",
     "hkdf", "hkdf_extract", "hkdf_expand", "enroll_key", "seal_key", "fingerprint",
     "string_to_sign", "sign", "verify", "sign_event", "verify_event",
+    "seal_aad", "SEAL_AAD_PREFIX", "SEAL_AAD_RESPONSE_PREFIX",
     "seal", "unseal", "seal_frames", "unseal_frames", "new_nonce_hex",
     "pure_aead_encrypt", "pure_aead_decrypt", "reset_nonce_guard",
     "NONCE_BYTES", "TAG_BYTES", "BLOB_FRAME_BYTES",
@@ -608,13 +612,61 @@ def reset_nonce_guard() -> None:
 # ---------------------------------------------------------------------------
 # Sealed bodies (SPEC 3.6)
 # ---------------------------------------------------------------------------
+#: The two AAD domain separators of SPEC 3.6, named once here so that no call
+#: site ever spells one out: "PARLEY/1-SEAL" and "PARLEY/1-SEAL-RESPONSE".
+SEAL_AAD_PREFIX = WIRE_VERSION + "-SEAL"
+SEAL_AAD_RESPONSE_PREFIX = WIRE_VERSION + "-SEAL-RESPONSE"
+
+
+def seal_aad(method: str, path: str, ts: str, nonce: str, session: str, agent: str,
+             *, response: bool = False) -> bytes:
+    """Build the exact AAD bytes SPEC 3.6 binds a sealed body to.
+
+    This is deliberately *not* :func:`string_to_sign`. The §3.3 string embeds
+    ``sha256(raw_request_body)``, and in sealed mode the raw body is the output
+    of the very AEAD call this AAD feeds -- so "the AAD is the string-to-sign"
+    would be circular and unimplementable. §3.6 therefore defines the same
+    identity binding with the body hash removed: version-and-direction, method,
+    path-with-query, timestamp, nonce, session, agent, newline-joined, UTF-8.
+
+    ``ts`` and ``nonce`` are always the **request's** values, in both
+    directions. A response uses the ``-RESPONSE`` prefix over those same values,
+    which binds each response to the exact request that produced it and makes a
+    response body unusable as a request body (and vice versa).
+
+    ``agent`` is the literal ``"enroll"`` during enrolment -- the one case where
+    the sealing key (``seal_key``) and the signing key (``enroll_key``) differ,
+    and historically the first place two implementations drifted.
+
+    Both ends MUST call this one function. SPEC 3.6 forbids trying several AADs
+    and accepting whichever authenticates: a wrong AAD does fail the Poly1305
+    tag, but probing turns a loud interoperability failure into a silent one and
+    lets two implementations drift apart permanently.
+    """
+    parts = [
+        SEAL_AAD_RESPONSE_PREFIX if response else SEAL_AAD_PREFIX,
+        method.upper(),
+        path,
+        str(ts),
+        nonce,
+        session,
+        agent,
+    ]
+    for part in parts:
+        if "\n" in part:
+            # Same reasoning as string_to_sign: a newline inside a component
+            # would let an attacker re-interpret every line after it.
+            raise ValueError("newline in a seal-AAD component")
+    return "\n".join(parts).encode("utf-8")
+
+
 def seal(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
     """Encrypt a body. Returns ``nonce(12) || ciphertext || tag(16)``.
 
-    The caller supplies the AAD, which for a request body is the SPEC 3.3
-    string-to-sign: that binds the ciphertext to the method, path, session and
-    agent, so a sealed body cannot be lifted out of one request and dropped into
-    another.
+    The caller supplies the AAD, which for a request or response body is
+    :func:`seal_aad`: that binds the ciphertext to the method, path, timestamp,
+    nonce, session and agent, so a sealed body cannot be lifted out of one
+    request and dropped into another.
     """
     _check_key(key)
     nonce = secrets.token_bytes(NONCE_BYTES)

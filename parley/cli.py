@@ -461,9 +461,11 @@ def _hub_config(workspace: Path):
 def _admin_request(hub_url: str, host_token: str, path: str, payload: Optional[dict], timeout: float) -> dict:
     """Call a ``/v1/admin/*`` endpoint with the host token.
 
-    The host token travels in ``X-Parley-Host-Token`` and, for belt and braces,
-    as an ``Authorization: Parley-Host`` credential.  Never in the URL: query
-    strings end up in proxy logs.
+    SPEC 3.7 pins the host token to exactly one carrier:
+    ``Authorization: Parley-Host <token>``.  Not a query string (it would land in
+    proxy and browser logs) and not a bespoke ``X-Parley-Host-Token`` header --
+    sending it two ways doubles the exposure surface and guarantees the two paths
+    eventually diverge.
     """
     import urllib.request
 
@@ -474,7 +476,6 @@ def _admin_request(hub_url: str, host_token: str, path: str, payload: Optional[d
         method="POST",
         headers={
             "Content-Type": "application/json; charset=utf-8",
-            "X-Parley-Host-Token": host_token,
             "Authorization": "Parley-Host " + host_token,
             "X-Parley-Version": "PARLEY/1",
         },
@@ -663,10 +664,67 @@ def _wrap(text: str, width: int) -> List[str]:
 # --------------------------------------------------------------------------- #
 
 
+def _existing_parley(server, workspace: Path) -> Optional[dict]:
+    """Facts about the parley already hosted from ``workspace``, or ``None``.
+
+    Best effort on purpose: this exists to make a refusal message concrete, and a
+    state directory too damaged to describe is still a state directory `init`
+    must not silently overwrite.
+    """
+    state_dir = server.find_hub_state_dir(workspace)
+    if state_dir is None:
+        return None
+    facts = {"state_dir": str(state_dir), "session": "", "fingerprint": "", "name": "",
+             "agents": None, "head_seq": None}
+    try:
+        config = _mod("parley.config").HubConfig.load(state_dir)
+        facts.update({"session": config.session, "fingerprint": config.fingerprint,
+                      "name": config.name})
+    except Exception:
+        return facts
+    try:
+        store = _mod("parley.hub.store").Store(state_dir)
+        try:
+            facts["agents"] = len(store.list_agents())
+            facts["head_seq"] = store.head_seq()
+        finally:
+            store.close()
+    except Exception:
+        pass
+    return facts
+
+
+def _refuse_to_clobber(existing: dict) -> CliError:
+    """`init` over a live state directory.  The one error that must not be terse."""
+    agents = existing.get("agents")
+    population = ("" if agents is None
+                  else " %d agent(s) are enrolled in it and would all be locked out." % agents)
+    return CliError(
+        "a parley already exists in %s" % existing["state_dir"],
+        code="hub_state_exists",
+        exit_code=EXIT_ERROR,
+        loud=True,
+        hint="Run `parley resume` instead: it restarts this same parley -- same session, same "
+             "fingerprint (%s), same log, same enrolled agents -- which is what a service "
+             "supervisor should invoke. `parley init --force` starts a GENUINELY NEW parley "
+             "over the top: new session id, new watchword, new fingerprint, and the existing "
+             "log, blobs and agent keys are deleted.%s"
+             % (existing.get("fingerprint") or "unknown", population),
+        detail=existing,
+    )
+
+
 def cmd_init(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
     server = _mod("parley.hub.server")
     workspace = _workspace(args)
     workspace.mkdir(parents=True, exist_ok=True)
+
+    existing = _existing_parley(server, workspace)
+    if existing and not args.force:
+        raise _refuse_to_clobber(existing)
+    if existing and args.force:
+        ctx.warn("--force: discarding the parley in %s. Every agent enrolled in session %s "
+                 "is locked out from now on." % (existing["state_dir"], existing["session"] or "?"))
 
     name = args.name or _default_parley_name(workspace)
     try:
@@ -679,6 +737,7 @@ def cmd_init(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
             sealed=bool(args.seal),
             require_approval=bool(args.approve),
             words=int(args.words),
+            force=bool(args.force),
         )
     except OSError as exc:
         raise CliError(
@@ -693,6 +752,14 @@ def cmd_init(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
     try:
         hub.start()
     except Exception as exc:
+        # A parley that never managed to listen has no log, no agents and nothing
+        # worth keeping -- and leaving its state directory behind would make the
+        # obvious retry fail with "a parley already exists here".
+        try:
+            hub.stop()
+        except Exception:
+            pass
+        server.discard_hub_state(hub.state_dir)
         raise _translate(exc)
 
     config = getattr(hub, "config", None)
@@ -749,9 +816,13 @@ def cmd_init(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
     # -- enrol the host so `parley say` works from here immediately ---------- #
     enrolled: Optional[dict] = None
     enrol_problem = ""
+    if existing and args.force:
+        # The credentials in this folder belong to the parley just discarded, so
+        # they authenticate against nothing.  Leaving them would make the host's
+        # own terminal the first victim of its own --force.
+        _drop_dead_credentials(workspace, existing.get("session", ""))
     if not args.no_join:
-        existing = (workspace / ".parley" / "credentials.json").exists()
-        if existing:
+        if (workspace / ".parley" / "credentials.json").exists():
             enrol_problem = "kept the credentials already in %s/.parley" % workspace
         else:
             try:
@@ -827,9 +898,17 @@ def cmd_init(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
         _emit_json({"ok": True, "command": "init", "exit_code": EXIT_OK, "data": payload})
         ctx.streaming = True  # already emitted; do not emit twice
 
-    # Serve until interrupted: the Hub lives inside this process, so stopping
-    # this process ends the parley. SIGTERM is routed through the same path as
-    # Ctrl-C so a process manager gets a clean shutdown too.
+    _serve_until_interrupted(ctx, hub)
+    return EXIT_OK, payload
+
+
+def _serve_until_interrupted(ctx: Ctx, hub) -> None:
+    """Block until Ctrl-C or SIGTERM, then stop the Hub cleanly.
+
+    The Hub lives inside this process, so stopping this process ends the parley.
+    SIGTERM is routed through the same path as Ctrl-C so a process manager gets
+    the same clean shutdown a human does.
+    """
     import signal
 
     def _term(_signum, _frame):
@@ -852,7 +931,26 @@ def cmd_init(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
             hub.stop()
         except Exception:
             pass
-    return EXIT_OK, payload
+
+
+def _drop_dead_credentials(workspace: Path, dead_session: str) -> None:
+    """Delete this folder's credentials if they belong to ``dead_session``.
+
+    Scoped to that one session on purpose: credentials for some *other* parley
+    this folder also takes part in are none of ``init --force``'s business.
+    """
+    path = workspace / ".parley" / "credentials.json"
+    if not dead_session or not path.exists():
+        return
+    try:
+        stored = json.loads(path.read_text("utf-8")).get("session", "")
+    except Exception:
+        return
+    if stored == dead_session:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _host_token_hint(workspace: Path, host_token: str) -> str:
@@ -875,6 +973,152 @@ def _default_agent_name() -> str:
         user = "agent"
     host = socket.gethostname().split(".")[0]
     return "%s@%s" % (user, host)
+
+
+# --------------------------------------------------------------------------- #
+# resume
+# --------------------------------------------------------------------------- #
+
+
+def render_resume(
+    t: Term,
+    *,
+    name: str,
+    session: str,
+    fingerprint: str,
+    hub_url: str,
+    deck_url: str,
+    workspace: str,
+    bind: str,
+    port: int,
+    agents: int,
+    head_seq: int,
+) -> List[str]:
+    """The `resume` banner: the same parley, carrying on.
+
+    Deliberately *not* :func:`render_invite`. That screen is built around a
+    watchword a human reads out loud, and resume does not mint one -- the Hub
+    stores only the derived root key and a hash of the words (SPEC 11), so the
+    old one is unrecoverable by design. Printing an invite screen with an empty
+    frame where the watchword goes would be worse than printing no frame at all.
+    """
+    width = t.layout_width(80)
+    dot = t.g["dot"]
+    lines: List[str] = []
+    lines += t.box(
+        [
+            t.paint(" ".join("PARLEY"), "bold", "cyan") + "   " + t.bold(name or "untitled parley"),
+            t.dim("%s  %s  resumed -- same session, same agents" % (session, dot)),
+        ],
+        width=width, style="cyan",
+    )
+    lines.append("")
+    facts: List[Tuple[str, str]] = [
+        ("Hub", hub_url + t.dim("   bound %s:%d" % (bind, port))),
+    ]
+    if deck_url:
+        facts.append(("Deck", t.paint(deck_url, "underline") + t.dim("   (open in a browser)")))
+    facts.append(("Fingerprint", t.paint(fingerprint or "(none)", "bold", "bcyan")))
+    facts.append(("Agents", "%d enrolled" % agents))
+    facts.append(("Log", "%d event(s)" % head_seq))
+    facts.append(("Workspace", workspace))
+    lines += ["  " + line for line in t.kv(facts, gap=3)]
+    lines.append("")
+    lines.append(t.dim("  Everyone already enrolled stays enrolled: their agent keys and the"))
+    lines.append(t.dim("  fingerprint are unchanged, so nobody has to re-join."))
+    lines.append(t.dim("  No watchword is printed -- resume does not mint one, and the old one is"))
+    lines.append(t.dim("  not stored in recoverable form. `parley invite --rotate` issues a new"))
+    lines.append(t.dim("  one without disconnecting anybody."))
+    lines.append("")
+    return lines
+
+
+def cmd_resume(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
+    server = _mod("parley.hub.server")
+    workspace = _workspace(args)
+
+    try:
+        hub = server.resume_parley(
+            workspace,
+            port=None if args.port is None else int(args.port),
+            bind=args.bind,
+        )
+    except OSError as exc:
+        raise CliError(
+            "cannot read the Hub state in %s (%s)" % (workspace, exc),
+            code="bad_hub_state",
+            hint="`parley resume` needs the state directory written by `parley init` -- "
+                 "check the path and that this user can read it.",
+        )
+    except Exception as exc:
+        raise _translate(exc)
+
+    try:
+        hub.start()
+    except Exception as exc:
+        err = _translate(exc)
+        if err.message.startswith("cannot bind"):
+            # The generic hint says "pick another port with init", which is the one
+            # thing someone resuming must not do.
+            err.code = "bind_failed"
+            err.hint = ("Another process is probably already on that port -- quite possibly "
+                        "the very Hub you are trying to resume. Stop it first, or resume on "
+                        "another port with --port.")
+        raise err
+
+    config = hub.config
+    policy = dict(getattr(config, "policy", None) or {})
+    try:
+        hub_url = public_url(hub.url)
+    except Exception:
+        hub_url = "http://%s:%d" % (config.bind, hub.port)
+    try:
+        deck_url = public_url(hub.deck_url(with_viewer_token=True))
+    except Exception:
+        deck_url = hub_url + "/"
+    agents = len(hub.store.list_agents())
+
+    payload = {
+        "session": config.session,
+        "name": config.name,
+        "fingerprint": config.fingerprint,
+        "hub_url": hub_url,
+        "deck_url": deck_url,
+        "bind": config.bind,
+        "port": hub.port,
+        "workspace": str(workspace),
+        "state_dir": str(hub.state_dir),
+        "agents": agents,
+        "head_seq": hub.store.head_seq(),
+        "policy": policy,
+        "resumed": True,
+        "serving": True,
+    }
+
+    if ctx.human:
+        ctx.out.blank()
+        ctx.out.write(render_resume(
+            ctx.out,
+            name=config.name,
+            session=config.session,
+            fingerprint=config.fingerprint,
+            hub_url=hub_url,
+            deck_url=deck_url,
+            workspace=str(workspace),
+            bind=config.bind,
+            port=hub.port,
+            agents=agents,
+            head_seq=payload["head_seq"],
+        ))
+        ctx.out.write(ctx.out.dim("  Ctrl-C stops the Hub. Resume it again with `parley resume`."))
+        ctx.out.blank()
+        ctx.out.flush()
+    else:
+        _emit_json({"ok": True, "command": "resume", "exit_code": EXIT_OK, "data": payload})
+        ctx.streaming = True  # already emitted; do not emit twice
+
+    _serve_until_interrupted(ctx, hub)
+    return EXIT_OK, payload
 
 
 def _default_kind() -> str:
@@ -1979,7 +2223,11 @@ def cmd_invite(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
     host_token = getattr(config, "host_token", "")
     bind = getattr(config, "bind", "127.0.0.1")
     port = int(getattr(config, "port", 7777))
-    hub_url = public_url("http://%s:%d" % ("127.0.0.1" if bind in ("0.0.0.0", "::", "") else bind, port))
+    # Two URLs on purpose: admin calls go to the address the Hub is actually
+    # listening on (a Hub bound to 127.0.0.1 is not reachable at the LAN
+    # address), while what gets printed is the one a colleague can type.
+    admin_url = "http://%s:%d" % ("127.0.0.1" if bind in ("0.0.0.0", "::", "") else bind, port)
+    hub_url = public_url(admin_url)
     policy = dict(getattr(config, "policy", None) or {})
     session = getattr(config, "session", "")
     fingerprint = getattr(config, "fingerprint", "")
@@ -1995,7 +2243,7 @@ def cmd_invite(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
     }
 
     if args.rotate:
-        result = _admin_request(hub_url, host_token, "/v1/admin/rotate-watchword", {}, ctx.timeout)
+        result = _admin_request(admin_url, host_token, "/v1/admin/rotate-watchword", {}, ctx.timeout)
         watchword = result.get("watchword") or ""
         if not watchword:
             raise CliError(
@@ -2014,7 +2262,7 @@ def cmd_invite(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
         return EXIT_OK, payload
 
     if args.deck:
-        result = _admin_request(hub_url, host_token, "/v1/admin/viewer-token",
+        result = _admin_request(admin_url, host_token, "/v1/admin/viewer-token",
                                 {"label": args.label or "cli"}, ctx.timeout)
         token = result.get("viewer_token") or result.get("token") or ""
         if not token:
@@ -2034,7 +2282,7 @@ def cmd_invite(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
         # (SPEC/config.HubConfig), so the plain words genuinely cannot be
         # recovered unless the Hub chose to keep them. Ask, then be honest.
         try:
-            result = _admin_request(hub_url, host_token, "/v1/admin/reveal-invite", {}, ctx.timeout)
+            result = _admin_request(admin_url, host_token, "/v1/admin/reveal-invite", {}, ctx.timeout)
         except CliError:
             result = {}
         watchword = (result or {}).get("watchword") or ""
@@ -2135,6 +2383,7 @@ def cmd_doctor(ctx: Ctx, args: argparse.Namespace) -> Tuple[int, dict]:
 EPILOGUE = """\
 getting started
   parley init                      host a parley; prints a watchword to read out loud
+  parley resume                    restart that same parley later; nobody has to re-join
   parley join --discover --invite "copper-otter-climbs-the-quiet-hill"
   parley run                       stay connected: sync files, keep your report fresh
   parley say "..." / parley status "..." / parley know "..." --kind finding
@@ -2230,7 +2479,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kind", help="your own agent kind (claude-code, cursor, human, ...)")
     p.add_argument("--no-join", action="store_true",
                    help="do not enrol this terminal as a participant, just host")
+    p.add_argument("--force", action="store_true",
+                   help="discard the parley already in this folder and start a new one -- "
+                        "every enrolled agent is locked out and the log is deleted")
     p.set_defaults(func=cmd_init)
+
+    # -- resume ------------------------------------------------------------- #
+    p = sub.add_parser("resume", parents=[common],
+                       help="restart the Hub on an existing parley, keeping everyone enrolled",
+                       description="Restart the Hub on the state directory `parley init` left "
+                                   "behind, keeping the session id, root key, fingerprint, event "
+                                   "log, blobs and enrolled agents. This -- not `init` -- is what "
+                                   "a service supervisor should run: `init` mints a new parley "
+                                   "every time and would strand every client behind a "
+                                   "fingerprint_mismatch. No watchword is printed, because "
+                                   "resume does not mint one.")
+    p.add_argument("--workspace", help="the folder the Hub was created in (default: current)")
+    p.add_argument("--port", type=int, default=None,
+                   help="bind a different port than the stored one (persisted)")
+    p.add_argument("--bind", default=None,
+                   help="bind a different address than the stored one (persisted)")
+    p.set_defaults(func=cmd_resume)
 
     # -- join -------------------------------------------------------------- #
     p = sub.add_parser("join", parents=[common], help="join a parley with a watchword",
@@ -2436,6 +2705,7 @@ def print_overview(stream=None) -> None:
     t.write("")
     t.write("  " + t.bold("Host a parley") + t.dim("  (you read the watchword out to the others)"))
     t.write("    parley init")
+    t.write("    parley resume" + t.dim("                    restart it later, same session, nobody re-joins"))
     t.write("")
     t.write("  " + t.bold("Join one"))
     t.write('    parley join --discover --invite "copper-otter-climbs-the-quiet-hill"')

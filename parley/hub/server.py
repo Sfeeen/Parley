@@ -31,6 +31,7 @@ import os
 import queue
 import re
 import select
+import shutil
 import socket
 import threading
 import time
@@ -1655,6 +1656,55 @@ def _make_handler(hub: Hub):
 # --------------------------------------------------------------- bootstrapping
 
 
+class HubStateExists(ParleyError):
+    """``create_parley`` was pointed at a directory that already holds a parley."""
+
+    code = "hub_state_exists"
+    http_status = 409
+
+
+class NoHubState(ParleyError):
+    """``resume_parley`` was pointed at something that is not a Hub state directory."""
+
+    code = "no_hub_state"
+    http_status = 404
+
+
+def hub_state_dir(workspace: Path) -> Path:
+    """Where a Hub hosted from ``workspace`` keeps its state.
+
+    One place, so ``init``, ``resume`` and every tool that has to find an
+    existing parley agree.  Nothing is created here -- see
+    :func:`find_hub_state_dir` for the "does one already exist" question.
+    """
+    return Path(workspace).expanduser() / ".parley" / "hub"
+
+
+def find_hub_state_dir(workspace: Path) -> "Optional[Path]":
+    """The state directory of the parley hosted from ``workspace``, or ``None``.
+
+    ``.parley`` itself is accepted as a fallback because very early versions of
+    Parley -- and a hand-restored backup -- can put ``hub.json`` there.
+    """
+    workspace = Path(workspace).expanduser()
+    for candidate in (hub_state_dir(workspace), workspace / ".parley"):
+        if (candidate / "hub.json").is_file():
+            return candidate
+    return None
+
+
+def discard_hub_state(state_dir: Path) -> None:
+    """Remove a Hub state directory, log, blobs and all.
+
+    Called for ``create_parley(force=True)``, and by the CLI to roll back a
+    parley that was created but never managed to listen.  It is a deliberate
+    amputation: a new parley has a new session id and a new root key, so the old
+    log and the old agent keys could not be used by it anyway, and leaving them
+    behind would mean a directory holding two sessions' rows.
+    """
+    shutil.rmtree(str(state_dir), ignore_errors=True)
+
+
 def create_parley(
     workspace: Path,
     *,
@@ -1665,6 +1715,7 @@ def create_parley(
     sealed: bool = False,
     require_approval: bool = False,
     words: int = 5,
+    force: bool = False,
 ) -> Tuple[Hub, str]:
     """Create a brand-new parley.
 
@@ -1672,8 +1723,27 @@ def create_parley(
     never written anywhere: the Hub persists only the derived root key and a
     sha256 of the normalised watchword (so ``parley invite`` can *check* a typed
     watchword without being able to reproduce it).
+
+    Refuses when ``workspace`` already hosts a parley: this mints a new session
+    id and a new root key, so running it over an existing state directory would
+    silently lock out every enrolled agent (they would get
+    ``fingerprint_mismatch``).  :func:`resume_parley` is what restarts an
+    existing one.  ``force=True`` destroys the existing state and starts over --
+    which is sometimes exactly what is wanted, but never by accident.
     """
     workspace = Path(workspace)
+    existing = find_hub_state_dir(workspace)
+    if existing is not None:
+        if not force:
+            raise HubStateExists(
+                "a parley already exists in %s" % existing,
+                detail={"state_dir": str(existing)},
+                hint="Restart it with `parley resume` -- that keeps the session id, the "
+                     "fingerprint, the log and every enrolled agent. `parley init --force` "
+                     "would throw all of that away.",
+            )
+        discard_hub_state(existing)
+
     state_dir = workspace_state_dir(workspace) / "hub"
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1728,3 +1798,82 @@ def load_parley(state_dir: Path, *, workspace: "Optional[Path]" = None) -> Hub:
     state_dir = Path(state_dir)
     config = HubConfig.load(state_dir)
     return Hub(state_dir, config, workspace=workspace)
+
+
+def _load_hub_config(state_dir: Path) -> HubConfig:
+    """Load and sanity-check ``hub.json``, or raise :class:`NoHubState`.
+
+    "The file parses" is not enough: a Hub with no session id or no root key
+    cannot authenticate anybody, and failing here with a clear message beats
+    starting and rejecting every request with ``bad_signature``.
+    """
+    try:
+        config = HubConfig.load(state_dir)
+    except Exception as exc:
+        raise NoHubState(
+            "%s/hub.json is not a readable Hub state file (%s)" % (state_dir, exc),
+            detail={"state_dir": str(state_dir)},
+            hint="Restore it from a backup (docs/DEPLOY.md 5.4), or start a new parley "
+                 "with `parley init --force` -- which locks out every agent enrolled in "
+                 "the old one.",
+        )
+    missing = [field for field in ("session", "root_key_hex")
+               if not str(getattr(config, field, "") or "")]
+    if missing:
+        raise NoHubState(
+            "%s/hub.json is missing %s" % (state_dir, " and ".join(missing)),
+            detail={"state_dir": str(state_dir), "missing": missing},
+            hint="Without those the Hub cannot be the same parley it was. Restore the file "
+                 "from a backup, or start a new parley with `parley init --force`.",
+        )
+    return config
+
+
+def resume_parley(
+    workspace: Path,
+    *,
+    port: "Optional[int]" = None,
+    bind: "Optional[str]" = None,
+) -> Hub:
+    """Restart the Hub on an existing state directory (SPEC 11).
+
+    This is the invocation a service supervisor must use.  ``create_parley``
+    mints a new session id and a new root key every time it runs, so a
+    ``Restart=on-failure`` unit pointed at ``init`` silently starts a *different*
+    parley and strands every enrolled client behind a ``fingerprint_mismatch``.
+    Here nothing is minted: the session id, root key, fingerprint, host token,
+    event log, blobs and roster are all read back off disk exactly as they were.
+
+    ``port`` and ``bind`` override what is stored and are then persisted, because
+    ``parley approve`` and ``parley invite`` reach the Hub at the address in
+    ``hub.json`` -- leaving the old one there would break them after a move.
+    """
+    workspace = Path(workspace)
+    state_dir = find_hub_state_dir(workspace)
+    if state_dir is None:
+        raise NoHubState(
+            "no parley is hosted from %s" % workspace,
+            detail={"workspace": str(workspace), "expected": str(hub_state_dir(workspace))},
+            hint="`resume` restarts an existing parley; there is no state directory here to "
+                 "restart. Start one with `parley init`, or point --workspace at the folder "
+                 "the Hub was created in.",
+        )
+
+    config = _load_hub_config(state_dir)
+    moved = False
+    if bind is not None and str(bind) != str(config.bind):
+        config.bind = str(bind)
+        moved = True
+    if port is not None and int(port) != int(config.port):
+        config.port = int(port)
+        moved = True
+    if moved:
+        config.save(state_dir)
+
+    hub = Hub(state_dir, config, workspace=workspace)
+    log.info(
+        "resumed parley '%s' session=%s fingerprint=%s head=%d agents=%d",
+        config.name, config.session, config.fingerprint,
+        hub.store.head_seq(), len(hub.store.list_agents()),
+    )
+    return hub

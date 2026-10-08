@@ -22,11 +22,12 @@ but "make every operation safely repeatable":
 
 Sealed mode and the stream
 --------------------------
-SPEC 3.6 defines sealing for request/response *bodies*. It does not define a
-framing for a sealed ``text/event-stream``. Rather than invent one that the Hub
-would not understand, a sealed client skips SSE entirely and uses the long-poll
-endpoint, whose body goes through the ordinary sealed request path. Confidentiality
-is preserved; only liveness latency changes (bounded by ``wait``).
+SPEC 3.6 defines sealing for request/response *bodies* and states that
+``text/event-stream`` has **no** sealed framing in PARLEY/1: a sealed client MUST
+NOT use ``/v1/stream``, and a Hub MUST answer 422 if it tries. A sealed client
+therefore skips SSE entirely and long-polls ``GET /v1/events?wait=``, whose body
+goes through the ordinary sealed path. Confidentiality is preserved; only
+liveness latency changes (bounded by ``wait``).
 """
 
 from __future__ import annotations
@@ -382,9 +383,19 @@ class Transport:
             return self._skew
 
     # -- signing ------------------------------------------------------------
-    def _auth_headers(self, method: str, path: str, outer_body: bytes) -> Dict[str, str]:
-        ts = str(int(time.time()))
-        nonce = crypto.new_nonce_hex()
+    def _stamp(self) -> Tuple[str, str]:
+        """One request's ``(timestamp, nonce)``.
+
+        Drawn once per attempt and then threaded through the seal AAD, the
+        signature and the headers. Drawing them twice is exactly the bug that
+        made sealed mode fail: the AAD then bound a timestamp and nonce the Hub
+        never saw, and every sealed body failed its Poly1305 tag.
+        """
+        return str(int(time.time())), crypto.new_nonce_hex()
+
+    def _auth_headers(self, method: str, path: str, outer_body: bytes,
+                      stamp: Optional[Tuple[str, str]] = None) -> Dict[str, str]:
+        ts, nonce = stamp if stamp is not None else self._stamp()
         sts = crypto.string_to_sign(
             method.upper(), path, outer_body, ts, nonce, self.session, self.agent_id
         )
@@ -401,51 +412,53 @@ class Transport:
             headers["X-Parley-Seal"] = "v1"
         return headers
 
-    def _seal_request(self, method: str, path: str, plain: bytes) -> Tuple[bytes, bytes]:
-        """Return ``(outer_body, aad)`` for a sealed request.
+    def _seal_aad(self, method: str, path: str, stamp: Tuple[str, str], *,
+                  response: bool) -> bytes:
+        """The SPEC 3.6 binding for this request, or for its response.
 
-        SPEC 3.6 says the AAD is "the string_to_sign of 3.3" and that the
-        signature is computed over the *sealed* body. Taken literally that is
-        circular - the sealed body cannot depend on a value derived from itself.
-        The only non-circular reading, and the one implemented here, is:
-
-        * the **AAD** is the string_to_sign built over the **plaintext** body
-          hash (it binds the ciphertext to method, path and identity, which is
-          the stated purpose), while
-        * the **Authorization signature** is built over the **sealed** body hash.
-
-        Both bindings therefore exist and neither depends on the other.
+        ``self.agent_id`` is the literal ``"enroll"`` while enrolling, which is
+        what the Hub reads out of ``X-Parley-Agent`` -- so the two sides agree
+        even though the body is sealed under ``seal_key`` and signed under
+        ``enroll_key``.
         """
-        ts = str(int(time.time()))
-        nonce = crypto.new_nonce_hex()
-        aad = crypto.string_to_sign(
-            method.upper(), path, plain, ts, nonce, self.session, self.agent_id
-        )
-        outer = crypto.seal(self._seal_key, plain, aad)
-        return outer, aad
+        ts, nonce = stamp
+        return crypto.seal_aad(method, path, ts, nonce, self.session, self.agent_id,
+                               response=response)
 
-    def _unseal_response(self, body: bytes, aad: bytes) -> bytes:
+    def _seal_request(self, method: str, path: str, plain: bytes,
+                      stamp: Tuple[str, str]) -> bytes:
+        """Seal a request body under the §3.6 AAD for this exact request.
+
+        The §3.3 signature is computed afterwards, over these sealed bytes
+        (``_auth_headers`` is called with the result), so the Hub verifies the
+        signature before it decrypts anything -- which is the order §3.6 makes
+        normative. The AAD itself contains no body hash, so nothing is circular.
+        """
+        return crypto.seal(self._seal_key, plain,
+                           self._seal_aad(method, path, stamp, response=False))
+
+    def _unseal_response(self, body: bytes, method: str, path: str,
+                         stamp: Tuple[str, str]) -> bytes:
         """Decrypt a sealed response body.
 
-        SPEC 3.6 does not state which AAD the Hub uses for the *response*. To
-        stay interoperable we try the plausible bindings in order and accept the
-        first that authenticates; a wrong AAD fails the Poly1305 tag, so this is
-        a safe trial rather than a weakening.
+        Exactly one AAD: ``PARLEY/1-SEAL-RESPONSE`` over *this request's*
+        timestamp and nonce, which is what ties the answer to the question.
+        SPEC 3.6 forbids trying several and taking whichever authenticates, so a
+        failure here is reported rather than probed around.
         """
         if not body:
             return body
-        candidates: List[bytes] = [aad, b""]
-        last_exc: Optional[Exception] = None
-        for cand in candidates:
-            try:
-                return crypto.unseal(self._seal_key, body, cand)
-            except Exception as exc:  # noqa: BLE001 - tag failure is expected while probing
-                last_exc = exc
-        raise errors.TransportError(
-            "could not decrypt sealed response body",
-            detail={"cause": str(last_exc)},
-            hint="Hub and client disagree on sealed-mode AAD, or the watchword differs.",
-        )
+        try:
+            return crypto.unseal(self._seal_key, body,
+                                 self._seal_aad(method, path, stamp, response=True))
+        except Exception as exc:  # noqa: BLE001 - surfaced as a transport error
+            raise errors.TransportError(
+                "could not decrypt sealed response body",
+                detail={"cause": str(exc)},
+                hint="Hub and client disagree on the SPEC 3.6 response AAD "
+                "(PARLEY/1-SEAL-RESPONSE, method, path, the request's timestamp "
+                "and nonce, session, agent), or the watchword differs.",
+            )
 
     # -- requests -----------------------------------------------------------
     def request(
@@ -491,11 +504,15 @@ class Transport:
                 break
             attempt += 1
             try:
+                # One timestamp and nonce per attempt, shared by the seal AAD,
+                # the signature and the headers (SPEC 3.6: the AAD carries the
+                # request's timestamp and nonce, and the response reuses them).
+                stamp = self._stamp()
                 if self._sealed and plain:
-                    outer, aad = self._seal_request(method, path, plain)
+                    outer = self._seal_request(method, path, plain, stamp)
                 else:
-                    outer, aad = plain, b""
-                req_headers = self._auth_headers(method, path, outer)
+                    outer = plain
+                req_headers = self._auth_headers(method, path, outer, stamp)
                 req_headers.update(extra)
                 if plain and "Content-Type" not in req_headers:
                     req_headers["Content-Type"] = "application/json; charset=utf-8"
@@ -504,7 +521,7 @@ class Transport:
                     method, url, outer, req_headers, timeout if timeout else self.timeout
                 )
                 if self._sealed and resp_headers.get("x-parley-seal") and resp_body:
-                    resp_body = self._unseal_response(resp_body, aad)
+                    resp_body = self._unseal_response(resp_body, method, path, stamp)
 
                 if status == 429:
                     delay = self._retry_after(resp_headers)
@@ -793,6 +810,15 @@ class Transport:
         return _events_of(payload)
 
     def _iter_sse(self, since: int, types: Optional[List[str]]) -> Iterator[dict]:
+        if self._sealed:
+            # SPEC 3.6: there is no sealed framing for text/event-stream, so a
+            # sealed client must not open one -- the Hub answers 422 if it does.
+            # `stream()` already chooses long-poll; this is the backstop that
+            # keeps a future caller from reaching SSE by another route.
+            raise errors.TransportError(
+                "a sealed client must not use /v1/stream",
+                hint="Sealed mode long-polls GET /v1/events?wait= instead (SPEC 3.6).",
+            )
         path = "/v1/stream?since={0}".format(int(since))
         if types:
             path += "&types=" + urllib.parse.quote(",".join(types), safe=",")
@@ -924,9 +950,10 @@ class Transport:
             try:
                 req_headers = self._auth_headers(method, path, body)
                 if self._sealed:
-                    # Blob frames carry their own AEAD; the body-level seal
-                    # header would tell the Hub to unseal twice.
-                    req_headers["X-Parley-Seal"] = "v1-frames"
+                    # SPEC 3.6 pins the header value to "v1" in both cases; what
+                    # selects per-frame sealing over a single envelope is the
+                    # /v1/blobs route, not a bespoke header value.
+                    req_headers["X-Parley-Seal"] = "v1"
                 req_headers.update(headers)
                 status, resp_headers, data = self._raw(
                     method, url, body, req_headers, max(self.timeout, 120.0)

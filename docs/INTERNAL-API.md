@@ -237,8 +237,23 @@ class Hub:
 
 def create_parley(workspace: Path, *, name: str, port: int = 7777, bind: str = "0.0.0.0",
                   public: bool = False, sealed: bool = False, require_approval: bool = False,
-                  words: int = 5) -> tuple[Hub, str]
-    """Returns (hub, watchword). The watchword is returned ONCE and never stored in plain form."""
+                  words: int = 5, force: bool = False) -> tuple[Hub, str]
+    """Returns (hub, watchword). The watchword is returned ONCE and never stored in plain form.
+       Raises HubStateExists when a parley already lives at this workspace unless force=True --
+       creating mints a NEW session id and root key, so overwriting strands every enrolled
+       agent behind a fingerprint_mismatch."""
+
+def resume_parley(workspace: Path, *, port: int | None = None,
+                  bind: str | None = None) -> Hub
+    """Restart the Hub on an EXISTING state directory, preserving the session id, root key,
+       fingerprint, host token, event log, blobs and enrolled agents. This is what a service
+       supervisor must invoke. Raises NoHubState when there is nothing to resume.
+       port/bind default to the persisted values and are written back when overridden,
+       because `approve` and `invite` read the Hub's address from hub.json."""
+
+def hub_state_dir(workspace: Path) -> Path          # <workspace>/.parley/hub
+def find_hub_state_dir(start: Path) -> Path | None  # walk up looking for one
+def discard_hub_state(workspace: Path) -> None      # used by init --force and bind-failure rollback
 ```
 `server.py` uses `http.server.ThreadingHTTPServer`. It must set `daemon_threads = True`,
 `protocol_version = "HTTP/1.1"`, and must not block the accept loop on a slow SSE client.

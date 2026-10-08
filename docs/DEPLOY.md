@@ -550,6 +550,20 @@ python3 -m pip install --user cryptography
 
 ### 4.1 systemd (Linux)
 
+**Create the parley once, by hand, first.** `init` is the command that mints the session and
+prints the watchword you read out to everybody; it is a one-off, not a service command:
+
+```sh
+cd /home/sven/work/parley-ws
+python3 -m parley init --name "my-parley" --bind 127.0.0.1 --port 7777 --no-join
+# write the watchword down, then Ctrl-C
+```
+
+The service then **resumes** that parley on every start. `parley resume` re-opens the state
+directory `init` left behind — same session id, same root key, same fingerprint, same log, same
+enrolled agents — so a restart is invisible to everyone connected. See [§4.5](#45-restart-semantics)
+for why the unit must never say `init`.
+
 `/etc/systemd/system/parley-hub.service`:
 
 ```ini
@@ -565,8 +579,8 @@ Group=sven
 WorkingDirectory=/home/sven/work/parley-ws
 Environment=PYTHONPATH=/home/sven/parley
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m parley init --name "my-parley" --bind 127.0.0.1 --port 7777
-Restart=on-failure
+ExecStart=/usr/bin/python3 -m parley resume --bind 127.0.0.1 --port 7777
+Restart=always
 RestartSec=5
 
 # Hardening. The Hub needs its state directory and the workspace, and nothing else.
@@ -589,10 +603,13 @@ sudo systemctl enable --now parley-hub
 journalctl -u parley-hub -f
 ```
 
-> **Important.** `parley init` creates a *new* parley, with a new session id and a new watchword,
-> every time it runs. A `Restart=on-failure` service therefore starts a fresh session rather than
-> resuming the old one. That is almost certainly not what you want for a long-lived Hub — see
-> [§4.5](#45-restart-semantics) before you enable this.
+`WorkingDirectory` is what `resume` resolves `.parley/hub` against, so it must be the folder the
+parley was created in. `--bind`/`--port` are optional on `resume`: with neither, it binds whatever
+is stored in `hub.json`; with either, it binds that and writes it back, so `parley approve` and
+`parley invite` on that machine keep reaching the right address.
+
+If the unit fails immediately with `no_hub_state`, nobody ran `init` in `WorkingDirectory` — the
+error says so and names the directory it looked in.
 
 For the tunnel as a second unit, `/etc/systemd/system/parley-tunnel.service`:
 
@@ -615,6 +632,9 @@ WantedBy=multi-user.target
 
 ### 4.2 launchd (macOS)
 
+As with systemd: run `parley init` once by hand in the workspace to create the parley and get the
+watchword, then let launchd `resume` it from then on.
+
 `~/Library/LaunchAgents/dev.parley.hub.plist`:
 
 ```xml
@@ -631,9 +651,7 @@ WantedBy=multi-user.target
     <string>/usr/bin/python3</string>
     <string>-m</string>
     <string>parley</string>
-    <string>init</string>
-    <string>--name</string>
-    <string>my-parley</string>
+    <string>resume</string>
     <string>--bind</string>
     <string>127.0.0.1</string>
     <string>--port</string>
@@ -680,7 +698,7 @@ Simplest, no extra software. Run as Administrator:
 ```powershell
 $action = New-ScheduledTaskAction `
   -Execute "py" `
-  -Argument "-3 -m parley init --name my-parley --bind 127.0.0.1 --port 7777" `
+  -Argument "-3 -m parley resume --bind 127.0.0.1 --port 7777" `
   -WorkingDirectory "$HOME\work\parley-ws"
 
 $trigger  = New-ScheduledTaskTrigger -AtStartup
@@ -718,7 +736,7 @@ Task Scheduler has no log handling. [NSSM](https://nssm.cc/) gives you a proper 
 choco install nssm      # or download from nssm.cc
 
 nssm install ParleyHub "C:\Windows\py.exe"
-nssm set ParleyHub AppParameters "-3 -m parley init --name my-parley --bind 127.0.0.1 --port 7777"
+nssm set ParleyHub AppParameters "-3 -m parley resume --bind 127.0.0.1 --port 7777"
 nssm set ParleyHub AppDirectory "C:\Users\sven\work\parley-ws"
 nssm set ParleyHub AppEnvironmentExtra "PYTHONPATH=C:\Users\sven\parley" "PYTHONUNBUFFERED=1"
 
@@ -742,21 +760,58 @@ nssm remove ParleyHub confirm
 
 ### 4.5 Restart semantics
 
-> **`parley init` creates a new parley.** New session id, new watchword, new fingerprint, new
-> credentials needed by everybody. A supervisor that restarts `parley init` on crash does **not**
-> resume the old session — it starts a different one, and every participant will fail with
-> `fingerprint_mismatch` or `no_such_session`.
+**`init` creates, `resume` restarts.** One is a one-off; the other is the service command.
 
-If you need a Hub that survives restarts with the same session, confirm with the implementation
-how it resumes from an existing state directory before you put it behind a supervisor. The state is
-all there — `hub.json` holds the session id, the root key, the fingerprint, the host token and the
-policy, and `parley.db` holds the entire log — so resumption is a matter of invocation, not of
-missing data.
+| | `parley init` | `parley resume` |
+|---|---|---|
+| Session id | new | **unchanged** |
+| Root key and fingerprint | new | **unchanged** |
+| Watchword | new, printed once | none minted, none printed |
+| Event log and blobs | empty | **kept** |
+| Enrolled agents | none | **all of them, still enrolled** |
+| Host token | new | **unchanged** |
+| Run it | once, by hand | every start, from the supervisor |
 
-Until that is settled, treat a supervised Hub as **"restart only on crash, and tell participants to
-re-join if the fingerprint changed"**, and make sure `parley doctor` is in your health check:
-clients detect a changed fingerprint and refuse to continue, which is the correct behaviour and
-exactly what you want to notice.
+So a supervisor must invoke `resume`. A unit that runs `init` starts a *different* parley on every
+restart, and every participant then fails with `fingerprint_mismatch` or `no_such_session` — see
+[TROUBLESHOOTING §3.1](TROUBLESHOOTING.md#31-everyone-broke-after-the-hub-restarted).
+
+`init` refuses to run over an existing state directory for exactly this reason, and tells you to
+use `resume` instead. It names the fingerprint and the number of agents that would be locked out,
+so a mistyped command in a terminal is a one-line error rather than a silent catastrophe.
+
+```sh
+cd /home/sven/work/parley-ws
+python3 -m parley resume                       # same parley, carrying on
+python3 -m parley resume --port 7800           # same parley, new port (persisted)
+python3 -m parley resume --json                # for a supervisor or a health check
+```
+
+`resume` prints a compact banner: the Hub URL, a freshly-minted Deck URL, the fingerprint, how many
+agents are enrolled and how long the log is. It does **not** print a watchword, because it does not
+mint one and the old one is not stored in recoverable form (SPEC §11). If you need a new watchword
+— because the old one leaked, or nobody wrote it down — `parley invite --rotate` issues one without
+disconnecting anybody.
+
+Exit codes are the usual ones: `0` running, `1` no usable state directory (the message says whether
+it is missing or unreadable, and names the path), `2` usage.
+
+#### Starting over on purpose
+
+`parley init --force` discards the parley in the folder and creates a new one. It deletes the event
+log, the blobs and the roster, and every currently-enrolled agent is locked out permanently — their
+keys were minted under a session that no longer exists. There is no undo and no way to re-admit
+them except a fresh `parley join`. Back up the state directory first ([§5](#5-backup-and-recovery))
+if there is any chance you will want it.
+
+#### Health check
+
+```sh
+curl -fsS http://127.0.0.1:7777/v1/hello | grep -q '"fingerprint":"lemon-anchor-fox"'
+```
+
+Pinning the *fingerprint*, not just liveness, is what catches the failure this section is about: a
+Hub that came back as a different parley answers `/v1/hello` perfectly happily.
 
 ---
 
@@ -827,7 +882,8 @@ tar czf ~/backups/parley-$(date +%F).tar.gz -C ~ .parley-hub-state
 sudo systemctl start parley-hub
 ```
 
-Note that stopping and starting may begin a *new* session — see [§4.5](#45-restart-semantics).
+Start it again with `parley resume` (which is what the unit above runs), not `init` — see
+[§4.5](#45-restart-semantics).
 
 ### 5.4 Restore
 
@@ -836,7 +892,8 @@ Note that stopping and starting may begin a *new* session — see [§4.5](#45-re
    `hub.json`).
 3. Remove any stale SQLite sidecars — `parley.db-wal` and `parley.db-shm` — if they were not part
    of a consistent snapshot. A `.backup` output does not need them.
-4. Start the Hub and run `parley doctor`.
+4. Start the Hub with `parley resume` — `init` would create a new parley on top of what you just
+   restored — and run `parley doctor`.
 5. **Confirm the fingerprint is unchanged.** If it is, participants reconnect with their existing
    credentials and resume from their last `seq`. If it changed, you restored the wrong thing, or a
    new session was created in the meantime.
@@ -879,6 +936,7 @@ Before you tell anyone the session is up:
       watchword.
 - [ ] The state directory is backed up, or you have accepted that it is not.
 - [ ] The host token is stored somewhere you will find it again.
+- [ ] If it is behind a supervisor, the unit runs `parley resume` and not `parley init`.
 
 ---
 

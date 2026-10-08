@@ -815,8 +815,8 @@ Exit codes: `0` ok · `1` generic error · `2` usage · `3` auth/credential fail
 | 400 | `bad_request`, `bad_json` |
 | 401 | `bad_signature`, `unknown_agent`, `stale_timestamp`, `replayed_nonce` |
 | 403 | `pending_approval`, `revoked`, `enroll_closed`, `read_only_token`, `host_token_required` |
-| 404 | `no_such_session`, `no_such_blob`, `no_such_agent` |
-| 409 | `seq_conflict`, `duplicate_event` |
+| 404 | `no_such_session`, `no_such_blob`, `no_such_agent`, `no_hub_state` |
+| 409 | `seq_conflict`, `duplicate_event`, `hub_state_exists`, `fingerprint_mismatch` |
 | 413 | `too_large` |
 | 422 | `bad_event`, `bad_path`, `unknown_type` |
 | 429 | `rate_limited` (with `Retry-After`) |

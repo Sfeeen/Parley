@@ -8,10 +8,18 @@ the number as "who put what on the record", never as a performance review, and s
 wherever it is displayed.
 
 **Why it is built this way.** SPEC R6 requires every number the Deck shows to be traceable
-back to events in the log. So there are no learned weights and no model here: five additive
+back to events in the log. So there are no learned weights and no model here: six additive
 components, fixed published weights, and an ``evidence`` list that names the exact ``seq``
 of every event that produced a point. ``parley ledger --why`` and the Deck's hover panel
 render that list directly — neither has to re-derive anything.
+
+That requirement binds hardest on the **one negative term**. ``service`` subtracts
+``abandoned_request_penalty`` for every request an agent accepted and then never answered
+(SPEC §15). A penalty a user cannot trace would violate R6 outright, so it is not a silent
+adjustment to a total: it is an ordinary ``evidence`` entry, with the ``seq`` of the Hub's
+``request.expired`` event and a label that says in words what happened and who was left
+waiting. Anything that takes points away has to be at least as explainable as anything that
+gives them.
 
 **Gaming resistance.** Any scoreboard an autonomous agent can see is a scoreboard it will
 try to climb. The deliberate defences are:
@@ -30,6 +38,9 @@ try to climb. The deliberate defences are:
 * *Delivery requires a claim.* ``task.done`` scores only for the agent that holds the task.
 * *Conflict sidecars are excluded*, so a divergence cannot be farmed for a second copy of
   the same content.
+* *Service is capped per requester-pair.* Two agents cannot take turns asking each other
+  for trivial work: past ``service_cap_per_requester`` points from one caller, further
+  results from that caller are worth nothing. Serving yourself is worth nothing at all.
 
 ``compute()`` is **pure**: no filesystem, no network, no clock, no randomness. Everything it
 needs arrives as an argument, including the reference time used for decay. That makes it
@@ -83,15 +94,20 @@ DEFAULT_WEIGHTS: Dict[str, Any] = {
     "citation_received_points": 0.5,
     "chat_message_points": 0.05,
     "chat_points_cap": 10.0,
+    "service_points": 3.0,
+    "service_priority_bonus": 0.5,
+    "service_cap_per_requester": 20.0,
+    "abandoned_request_penalty": -5.0,
     "decay_half_life_days": 0,
 }
 
-#: The five components, in display order. Every ``LedgerLine`` carries all five, always.
+#: The six components, in display order. Every ``LedgerLine`` carries all six, always.
 COMPONENTS: Tuple[str, ...] = (
     "contributions",
     "authored",
     "delivery",
     "influence",
+    "service",
     "presence",
 )
 
@@ -251,6 +267,23 @@ def merge_weights(weights: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     )
     merged["chat_points_cap"] = _as_float(
         merged.get("chat_points_cap"), DEFAULT_WEIGHTS["chat_points_cap"]
+    )
+    merged["service_points"] = _as_float(
+        merged.get("service_points"), DEFAULT_WEIGHTS["service_points"]
+    )
+    merged["service_priority_bonus"] = _as_float(
+        merged.get("service_priority_bonus"), DEFAULT_WEIGHTS["service_priority_bonus"]
+    )
+    merged["service_cap_per_requester"] = _as_float(
+        merged.get("service_cap_per_requester"), DEFAULT_WEIGHTS["service_cap_per_requester"]
+    )
+    # The published default is negative and SPEC §9 describes the term as "minus the
+    # penalty", so both spellings are in the wild. Normalising to a negative number
+    # means a workspace that writes `5` gets a penalty of five points rather than a
+    # five-point reward for abandoning a request, which would be a very funny bug.
+    merged["abandoned_request_penalty"] = -abs(
+        _as_float(merged.get("abandoned_request_penalty"),
+                  DEFAULT_WEIGHTS["abandoned_request_penalty"])
     )
     merged["decay_half_life_days"] = _as_float(
         merged.get("decay_half_life_days"), DEFAULT_WEIGHTS["decay_half_life_days"]
@@ -471,6 +504,10 @@ def compute(
     citation_points = w["citation_received_points"]
     chat_points = w["chat_message_points"]
     chat_cap = w["chat_points_cap"]
+    service_points = w["service_points"]
+    service_bonus = w["service_priority_bonus"]
+    service_cap = w["service_cap_per_requester"]
+    abandon_penalty = w["abandoned_request_penalty"]
     half_life = w["decay_half_life_days"]
 
     ordered = [e for _, e in sorted(
@@ -498,6 +535,12 @@ def compute(
     supersede_claims = []  # type: List[Tuple[str, str, str]]
     contribution_ids = set()  # type: set
     blame = {}  # type: Dict[str, Dict[str, Any]]
+    #: SPEC §15: who asked for what, who took it on, and who answered. Built in pass
+    #: one because the award in pass two needs the *requester* and the *priority*,
+    #: and both of those live on the `request.create` the result refers back to.
+    requests = {}  # type: Dict[str, Dict[str, Any]]
+    accepted_by = {}  # type: Dict[str, str]
+    answered = set()  # type: set
 
     for event in ordered:
         actor = event.get("actor")
@@ -538,6 +581,26 @@ def compute(
             path = body.get("path")
             if isinstance(path, str):
                 blame.pop(path, None)
+        elif etype == "request.create":
+            req_id = body.get("id")
+            if isinstance(req_id, str) and req_id and req_id not in requests:
+                capability = body.get("capability")
+                requests[req_id] = {
+                    "from": actor,
+                    "to": body.get("to") if isinstance(body.get("to"), str) else "any",
+                    "priority": _as_int(body.get("priority"), 3),
+                    "what": capability if isinstance(capability, str) and capability
+                            else "a free-form instruction",
+                    "seq": seq,
+                }
+        elif etype == "request.accept":
+            req_id = body.get("id")
+            if isinstance(req_id, str) and req_id and req_id not in accepted_by:
+                accepted_by[req_id] = actor
+        elif etype in ("request.result", "request.decline"):
+            req_id = body.get("id")
+            if isinstance(req_id, str) and req_id:
+                answered.add(req_id)
 
     # `supersedes` is a *replacement*, so a whole chain of restatements is worth one
     # contribution: the links are unioned into a group and only the newest member of each
@@ -602,6 +665,10 @@ def compute(
     tasks_paid = set()  # type: set
     chat_earned = {agent: 0.0 for agent in agents}  # type: Dict[str, float]
     chat_suppressed = {}  # type: Dict[str, Dict[str, Any]]
+    #: (provider, requester) -> points already paid. The cap is per *pair*, which is
+    #: what stops two agents farming each other with trivial back-and-forth.
+    service_earned = {}  # type: Dict[Tuple[str, str], float]
+    service_paid = set()  # type: set
 
     for event in ordered:
         actor = event.get("actor")
@@ -702,6 +769,18 @@ def compute(
                     task=task_id,
                 )
 
+        elif etype == "request.result":
+            _award_service(
+                me, body, actor, seq, event_id, decay,
+                requests=requests,
+                accepted_by=accepted_by,
+                earned=service_earned,
+                paid=service_paid,
+                base_points=service_points,
+                priority_bonus=service_bonus,
+                cap=service_cap,
+            )
+
         if etype in ("chat.message", "knowledge.contribution"):
             # SPEC §9: influence is "times *another* agent cited this agent's event".
             seen = set()  # type: set
@@ -769,6 +848,46 @@ def compute(
                     event_id=event_id,
                     decay=decay,
                 )
+
+    # ---- the one negative term --------------------------------------------------
+    # SPEC §15.3 calls silently dropping an accepted request the one unforgivable
+    # Exchange behaviour, and §9 makes it the only thing in the Ledger that costs
+    # points. The charge is raised strictly off the Hub's `request.expired` event:
+    # a request still legitimately in flight when `compute` runs has *not* been
+    # abandoned, and guessing otherwise would punish an agent for being slow.
+    for event in ordered:
+        if event.get("type") != "request.expired":
+            continue
+        body = event.get("body")
+        if not isinstance(body, Mapping):
+            continue
+        req_id = body.get("id")
+        if not isinstance(req_id, str) or req_id in answered:
+            continue
+        provider = accepted_by.get(req_id)
+        if not isinstance(provider, str) or not provider or provider == HUB_ACTOR:
+            continue  # nobody accepted it: nobody promised anything
+        me = scorer(provider)
+        if me is None:
+            continue
+        info = requests.get(req_id, {})
+        requester = info.get("from", "")
+        if requester == provider:
+            continue  # abandoning your own request harms nobody but yourself
+        seq = _as_int(event.get("seq"), 0)
+        me.add(
+            "service",
+            seq,
+            "accepted request {0} from {1} ({2}) and never answered it".format(
+                req_id, _short(requester) if requester else "another agent",
+                _clip(str(info.get("what", "unknown work")), 40),
+            ),
+            abandon_penalty,
+            event_id=event.get("id") if isinstance(event.get("id"), str) else "",
+            request=req_id,
+            abandoned=True,
+            penalty=True,
+        )
 
     for actor, record in chat_suppressed.items():
         me = scorer(actor)
@@ -879,6 +998,116 @@ def compute(
         weights=w,
         computed_at=computed_at or "",
         event_count=len(ordered),
+    )
+
+
+def _award_service(
+    me: "_Scorer",
+    body: Mapping[str, Any],
+    actor: str,
+    seq: int,
+    event_id: str,
+    decay: float,
+    *,
+    requests: Mapping[str, Mapping[str, Any]],
+    accepted_by: Mapping[str, str],
+    earned: Dict[Tuple[str, str], float],
+    paid: set,
+    base_points: float,
+    priority_bonus: float,
+    cap: float
+) -> None:
+    """Score one ``request.result`` as the SPEC §15 **service** component.
+
+    The defences, in the order an agent would try to get round them:
+
+    * *Only the provider is paid*, and only when the request was addressed to it or
+      it is the agent that accepted an open ``to: "any"`` offer. Emitting a result
+      for somebody else's request buys nothing.
+    * *Serving yourself is worth nothing*, exactly as self-citation is.
+    * *Once per request id.* A provider that re-sends its result is idempotent, not
+      twice as useful.
+    * *Failures pay nothing but cost nothing.* ``ok: false`` is still an answer, so
+      it earns no points and incurs no abandonment penalty. A provider should never
+      be better off staying silent than admitting a failure.
+    * *Capped per requester-pair.* Past ``service_cap_per_requester`` from one
+      caller the well runs dry, which is what makes mutual farming pointless. The
+      capped result still gets an evidence line saying so, because a point that
+      was not awarded is as much a part of the explanation as one that was.
+
+    ``priority`` scales the award additively (``base + bonus × (priority − 3)``)
+    rather than multiplicatively: a priority-1 errand is worth less than a
+    priority-5 one, but it is never worth *nothing*, which a multiplier would make
+    it at the bottom of the scale.
+    """
+    req_id = body.get("id")
+    if not isinstance(req_id, str) or not req_id:
+        return
+    info = requests.get(req_id)
+    if info is None:
+        return  # a result for a request that is not in this log; nothing to price
+    holder = accepted_by.get(req_id, "")
+    addressed = info.get("to")
+    if holder:
+        if holder != actor:
+            return
+    elif addressed != actor:
+        return
+    requester = info.get("from", "")
+    if not isinstance(requester, str) or not requester or requester == actor:
+        return
+    if req_id in paid:
+        return
+    paid.add(req_id)
+
+    what = _clip(str(info.get("what", "work")), 40)
+    if not body.get("ok", True):
+        me.add(
+            "service",
+            seq,
+            "answered {0} for {1} with a failure ({2}): no points, no penalty".format(
+                req_id, _short(requester), what
+            ),
+            0.0,
+            event_id=event_id,
+            request=req_id,
+            requester=requester,
+        )
+        return
+
+    priority = _as_int(info.get("priority"), 3)
+    priority = max(1, min(5, priority))
+    award = max(0.0, base_points + priority_bonus * (priority - 3)) * decay
+
+    key = (actor, requester)
+    already = earned.get(key, 0.0)
+    room = cap - already
+    if room <= 0.0:
+        me.add(
+            "service",
+            seq,
+            "served {0} again ({1}): the {2:g}-point cap for one requester is reached".format(
+                _short(requester), what, cap
+            ),
+            0.0,
+            event_id=event_id,
+            request=req_id,
+            requester=requester,
+            capped=True,
+        )
+        return
+    award = min(award, room)
+    earned[key] = already + award
+    me.add(
+        "service",
+        seq,
+        "served {0}: {1} (priority {2})".format(_short(requester), what, priority),
+        award,
+        event_id=event_id,
+        decay=decay,
+        request=req_id,
+        requester=requester,
+        priority=priority,
     )
 
 

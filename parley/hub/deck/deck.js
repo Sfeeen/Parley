@@ -2052,9 +2052,12 @@
 
   /* =============================================================== 20. admin */
 
+  /* SPEC 3.7 pins the host token to exactly one carrier: Authorization:
+     Parley-Host. Not a query parameter (it would land in proxy and browser
+     logs) and not a second bespoke header -- sending it twice only doubles the
+     exposure and guarantees the two paths eventually diverge. */
   function hostHeaders() {
     return {
-      "X-Parley-Host-Token": HST,
       "Authorization": "Parley-Host " + HST,
       "Content-Type": "application/json"
     };

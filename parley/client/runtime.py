@@ -10,9 +10,17 @@ Thread          Responsibility
                 mirror everything into the pigeonhole.
 ``sync``        Poll the workspace and publish local changes.
 ``house``       Heartbeats, the PSR freshness contract, the outbox drain,
-                ``me.json``, and the ``state.json``/``roster.json`` mirrors.
+                ``me.json``, the ``state.json``/``roster.json`` mirrors, and
+                the Exchange's watchdog tick.
 main            Install signal handlers, supervise, shut down cleanly.
 ==============  =====================================================
+
+Delegated work (SPEC 15) adds a *bounded* number of short-lived worker
+threads, one per accepted request, owned by :class:`~parley.client.exchange.Provider`.
+They are deliberately not part of the supervision scheme above: a handler
+crashing is a request that failed, not a daemon that should exit, and the
+Provider converts it into ``request.result{ok:false}`` without ever reaching
+:meth:`Runtime._guard`.
 
 Supervision policy
 ------------------
@@ -32,6 +40,14 @@ set a single :class:`threading.Event`. Every blocking wait in this package is an
 ``Event.wait``, not a bare ``sleep``, so shutdown is prompt rather than
 "whenever the poll interval happens to elapse". A second signal force-exits, for
 the case where the network stack is wedged and a clean ``agent.bye`` would hang.
+
+**Shutdown order is load-bearing.** The Exchange settles first - every accepted
+request gets its terminal ``request.result`` or ``request.decline`` - then
+``agent.bye`` goes out, and only then does the transport close. Each step needs
+the one after it to still be usable: closing the socket first would turn an
+orderly set of failed results into exactly the silent abandonment SPEC 15.3
+calls unforgivable, and would leave every peer waiting for a timeout that need
+never have happened.
 """
 
 from __future__ import annotations
@@ -47,8 +63,10 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from .. import errors
 from ..config import Credentials, DEFAULTS, workspace_state_dir
+from ..exchange import Decision, Policy
 from ..jsonutil import atomic_write, dumps, loads
 from .client import ParleyClient
+from .exchange import Provider, Requester
 from .pigeonhole import Pigeonhole
 from .sync import WorkspaceSync
 
@@ -83,11 +101,13 @@ class Runtime:
         pigeonhole: bool = True,
         psr_from: str = "",
         client: Optional[ParleyClient] = None,
+        exchange: bool = True,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.state_dir = workspace_state_dir(self.workspace)
         self.want_sync = bool(sync)
         self.want_pigeonhole = bool(pigeonhole)
+        self.want_exchange = bool(exchange)
         #: `parley run --psr-from FILE` (SPEC 11). A bare filename is read from
         #: `.parley/`, which is where an agent naturally writes it; a path with
         #: a separator is taken as given so a harness can point at its own file.
@@ -96,6 +116,16 @@ class Runtime:
         self.client: Optional[ParleyClient] = client
         self.sync: Optional[WorkspaceSync] = None
         self.pigeonhole: Optional[Pigeonhole] = None
+        #: The Exchange (SPEC 15). The two halves keep *separate*
+        #: :class:`RequestTracker` instances on purpose: each folds the stream in
+        #: exactly once, and a tracker fed the same event twice would record the
+        #: second as an illegal transition. They see the same log, so they reach
+        #: the same conclusions anyway.
+        #: Local consent policy (SPEC 15.4), distinct from ``self.policy``, which
+        #: is the *Hub's* operational policy (heartbeat intervals and the like).
+        self.provider: Optional[Provider] = None
+        self.requester: Optional[Requester] = None
+        self.consent_policy: Optional[Policy] = None
 
         self._stop = threading.Event()
         self._threads: Dict[str, threading.Thread] = {}
@@ -217,8 +247,57 @@ class Runtime:
                 self.pigeonhole.me_path = candidate.resolve() if candidate.exists() else candidate
                 log.info("reading the standing report from %s", self.pigeonhole.me_path)
 
+        if self.want_exchange:
+            self._setup_exchange()
+
         self.client.announce()
         self._initial_psr()
+        if self.provider is not None:
+            # After `agent.hello`, so a peer that is replaying the log sees who we
+            # are before it sees what we are offering.
+            self.provider.announce()
+
+    def _setup_exchange(self) -> None:
+        """Bring up the Exchange (SPEC 15) for this agent.
+
+        Capabilities come from ``.parley/capabilities.json`` when it exists. Those
+        are *manual* by definition - a file cannot carry a function - so the daemon
+        surfaces each request through ``.parley/requests.json`` and the agent answers
+        with ``parley fulfil`` or an outbox line. An embedder that wants handlers
+        calls :meth:`Provider.register` on ``runtime.provider`` before :meth:`run`.
+        """
+        assert self.client is not None
+        self.consent_policy = Policy.load(self.workspace)
+        self.provider = Provider(
+            self.client, self.workspace, policy=self.consent_policy,
+        )
+        self.provider.on_ask = self._on_consent_needed
+        self.requester = Requester(self.client)
+        loaded = self.provider.register_from_file()
+        if loaded:
+            log.info("loaded %d capabilit(ies) from .parley/capabilities.json", loaded)
+        self.provider.write_sidecars(force=True)
+
+    def _on_consent_needed(self, record: Dict[str, Any], decision: Decision) -> None:
+        """Surface an ``ask`` where a human or the agent will actually see it.
+
+        Three places, because there are three kinds of operator: the daemon log for
+        whoever is watching the terminal, ``.parley/pending.json`` for a file-only
+        agent (the Provider writes that itself), and - loudest - a line that names
+        the requester and the reason, because a consent prompt that does not say who
+        is asking and why is not a consent prompt.
+        """
+        log.warning(
+            "CONSENT NEEDED: %s asks for %s - %r. %s "
+            "Approve with `parley requests --accept %s`, refuse with "
+            "`parley requests --decline %s`.",
+            record.get("from", "?"),
+            record.get("capability") or "a free-form instruction",
+            str(record.get("reason", ""))[:160],
+            decision.why,
+            record.get("id", "?"),
+            record.get("id", "?"),
+        )
 
     def _initial_psr(self) -> None:
         """Be conforming from the first second (SPEC 6.1).
@@ -243,10 +322,21 @@ class Runtime:
 
     def _shutdown(self) -> int:
         self._stop.set()
-        # Order matters: say goodbye while the transport is still usable, then
-        # close it (which unblocks the stream thread's socket read), then join.
-        # Closing first would make `agent.bye` fail and leave every peer waiting
-        # for a timeout that need never have happened.
+        # Order matters, and the Exchange goes first (SPEC 15.3). Every request this
+        # agent accepted gets a terminal `request.result` while the transport is
+        # still open; anything awaiting consent is declined `offline`. Exiting is
+        # not an excuse for the one unforgivable Exchange behaviour, and a peer that
+        # is told "the provider shut down" can act on that immediately instead of
+        # waiting out a timeout.
+        if self.provider is not None:
+            try:
+                self.provider.shutdown()
+            except Exception as exc:  # noqa: BLE001 - never block the exit path
+                log.error("could not settle outstanding requests on exit (%s)", exc)
+        # Then say goodbye while the transport is still usable, then close it
+        # (which unblocks the stream thread's socket read), then join. Closing
+        # first would make `agent.bye` fail and leave every peer waiting for a
+        # timeout that need never have happened.
         if self.client is not None:
             reason = "shutdown" if self._exit_code == EXIT_OK else "error"
             self.client.bye(reason)
@@ -369,6 +459,11 @@ class Runtime:
                 self.client.repeat_psr()
         except errors.ParleyError as exc:
             log.debug("re-announce failed (%s)", exc)
+        if self.provider is not None:
+            # SPEC 15.1: `capability.announce` is total and idempotent, so simply
+            # re-sending the whole catalogue is both correct and cheap. There is no
+            # diff to compute and nothing to get wrong.
+            self.provider.announce()
 
     def _dispatch(self, event: dict) -> None:
         """Route one event. A failure here must never break the stream."""
@@ -385,6 +480,17 @@ class Runtime:
         except Exception as exc:  # noqa: BLE001
             log.error("pigeonhole could not mirror %s: %s", etype, exc)
             log.debug("%s", traceback.format_exc())
+        # The Exchange is fed last and each half separately: `Provider.on_event` can
+        # decide to accept and start work, and that must not come before the file
+        # sync has had the chance to land whatever the request refers to.
+        for consumer in (self.provider, self.requester):
+            if consumer is None:
+                continue
+            try:
+                consumer.on_event(event)
+            except Exception as exc:  # noqa: BLE001
+                log.error("exchange could not handle %s: %s", etype, exc)
+                log.debug("%s", traceback.format_exc())
 
         if etype == "agent.revoked":
             body = event.get("body")
@@ -433,6 +539,11 @@ class Runtime:
                 self._safe("outbox", self._drain_outbox)
                 self._safe("me.json", self._refresh_me)
                 self._safe("state mirror", self.pigeonhole.refresh_state)
+            if self.provider is not None:
+                # The Exchange watchdog: timeouts, the unsent-result retry queue and
+                # the consent deadline. It must run on *every* tick, because what it
+                # guarantees is that no accepted request goes unanswered.
+                self._safe("exchange", self.provider.pump)
             if (now - last_heartbeat) >= self.heartbeat_s:
                 last_heartbeat = now
                 self._safe("heartbeat", self._heartbeat)

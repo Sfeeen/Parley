@@ -517,7 +517,12 @@ def normalise_path(p: str) -> str:
       ``evil.`` and ``evil`` become the same file.
     * C0/C1 control characters and bidirectional-override characters.
 
-    ``.`` segments are dropped as the no-ops they are; ``..`` is always refused.
+    Nothing here rewrites: SPEC 7.1 says a wire path *has* no ``.`` or ``..``
+    segment and no backslash, and that the Hub MUST reject anything else. Quietly
+    canonicalising ``./a.py`` to ``a.py`` or ``a\\b.py`` to ``a/b.py`` is safe
+    against traversal, but it stores a path the author never sent and lets two
+    agents address one file by two spellings. The only normalisation applied is
+    the one the SPEC mandates, NFC.
     """
     if not isinstance(p, str):
         raise BadPath("path must be a string, got %s" % type(p).__name__)
@@ -532,10 +537,12 @@ def normalise_path(p: str) -> str:
         if ch in _DECEPTIVE_CHARS:
             raise BadPath("path contains a bidirectional or zero-width control character")
 
-    # A backslash is never a literal character in a wire path (SPEC 7.1); treating
-    # it as a separator here means a Windows-style traversal is caught by the same
-    # segment checks as a POSIX one rather than slipping through as a filename.
-    text = text.replace("\\", "/")
+    # A backslash is never anything in a wire path (SPEC 7.1) -- not a separator,
+    # not a literal character in a name. Rejecting rather than rewriting also
+    # means "..\\..\\win.ini" is refused on its own terms instead of being
+    # converted into a POSIX traversal and then refused for a different reason.
+    if "\\" in text:
+        raise BadPath("path may not contain a backslash; wire paths are POSIX-separated")
 
     if ":" in text:
         raise BadPath("path may not contain ':' (drive letter or NTFS alternate "
@@ -550,7 +557,7 @@ def normalise_path(p: str) -> str:
         if raw == "":
             raise BadPath("path contains an empty segment")
         if raw == ".":
-            continue
+            raise BadPath("path contains a '.' segment")
         if raw == "..":
             raise BadPath("path contains a '..' segment")
         if raw != raw.rstrip(". "):
@@ -560,9 +567,6 @@ def normalise_path(p: str) -> str:
         if len(raw.encode("utf-8")) > MAX_PATH_SEGMENT_BYTES:
             raise BadPath("path segment is longer than %d bytes" % MAX_PATH_SEGMENT_BYTES)
         segments.append(raw)
-
-    if not segments:
-        raise BadPath("path resolves to nothing")
 
     result = "/".join(segments)
     if len(result.encode("utf-8")) > MAX_PATH_BYTES:

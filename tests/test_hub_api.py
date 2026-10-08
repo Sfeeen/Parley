@@ -293,7 +293,7 @@ class TestPendingApproval(HubAPITestCase):
         agent_id, key, _ = self.enrolled_agent()
         status, _, payload = self.call(
             "POST", "/v1/admin/approve", {"agent_id": agent_id}, sign=False,
-            headers={"X-Parley-Host-Token": self.host_token},
+            headers={"Authorization": "Parley-Host " + self.host_token},
         )
         self.assertIn(status, (200, 201, 204), payload)
         self.assertEqual(self.hub.store.get_agent(agent_id)["status"], "active")
@@ -643,7 +643,7 @@ class TestHostTokenEndpoints(HubAPITestCase):
 
     def host(self, path, body=None):
         return self.call("POST", path, body or {}, sign=False,
-                         headers={"X-Parley-Host-Token": self.host_token})
+                         headers={"Authorization": "Parley-Host " + self.host_token})
 
     ADMIN_PATHS = ("/v1/admin/approve", "/v1/admin/revoke",
                    "/v1/admin/rotate-watchword", "/v1/admin/viewer-token")
@@ -668,7 +668,7 @@ class TestHostTokenEndpoints(HubAPITestCase):
 
     def test_a_wrong_host_token_is_refused(self):
         status, _, payload = self.call("POST", "/v1/admin/viewer-token", {}, sign=False,
-                                       headers={"X-Parley-Host-Token": "hst_" + "0" * 32})
+                                       headers={"Authorization": "Parley-Host hst_" + "0" * 32})
         self.assertIn(status, (401, 403), payload)
 
     def test_the_host_can_revoke_an_agent(self):

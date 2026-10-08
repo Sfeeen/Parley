@@ -35,6 +35,7 @@ Most of what follows is "what to do when `doctor` points at something".
 | `403 pending_approval` | [§2.4](#24-403-pending_approval) |
 | `403 enroll_closed` | [§2.5](#25-403-enroll_closed) |
 | Fingerprint does not match | [§3](#3-fingerprint-mismatch) |
+| Everyone broke after the Hub restarted | [§3.1](#31-everyone-broke-after-the-hub-restarted) |
 | Events arrive late, or in bursts | [§4.1](#41-sse-events-arrive-in-bursts-or-not-at-all) |
 | Constant reconnecting on the Deck | [§4.2](#42-the-connection-drops-every-30-60-seconds) |
 | Files do not sync | [§5](#5-sync) |
@@ -271,7 +272,7 @@ proves you reached the Hub the watchword belongs to and that nobody is relaying 
 
 | Cause | What it means |
 |---|---|
-| A new parley was started on the same URL | `parley init` creates a *new* session every time. The common benign cause. |
+| The Hub was restarted with `init` instead of `resume` | `parley init` creates a *new* session every time. By far the most common cause — see [§3.1](#31-everyone-broke-after-the-hub-restarted). |
 | You are on the wrong Hub | Someone gave you the wrong URL. |
 | You have the wrong watchword | A different session's invite. |
 | **Someone is relaying you to a different Hub** | The attack the check exists to catch. |
@@ -289,6 +290,57 @@ If they did not: **you have found something. Tell a human and stop.**
 
 A client must never auto-accept a changed fingerprint for a known session. If yours does, that is a
 bug — report it.
+
+### 3.1 Everyone broke after the Hub restarted
+
+Symptom: the Hub was restarted — a reboot, a crash a supervisor recovered from, or someone
+re-running the start command — and now **every** participant fails at once with
+`fingerprint_mismatch` (exit `5`) or `no_such_session`. Nothing was reconfigured and nothing is
+wrong with the network.
+
+Cause: the Hub was restarted with `parley init`, which mints a new session id and a new root key on
+every run. The new Hub is a *different parley* at the same address, and nobody's credentials belong
+to it.
+
+**On the Hub machine**, check whether the old parley is still on disk — it almost certainly is,
+because `init` writes its state beside it rather than over it:
+
+```sh
+cd /path/to/workspace
+cat .parley/hub/hub.json | python3 -m json.tool | grep -E '"(session|fingerprint|created)"'
+```
+
+Compare that `fingerprint` with the three words the participants are expecting.
+
+**If it matches**, nothing was lost. Stop the Hub that is running now and bring the original back:
+
+```sh
+python3 -m parley resume          # same session, same log, same enrolled agents
+```
+
+Everyone reconnects with the credentials they already have. Nobody re-joins, nobody needs the
+watchword again.
+
+**If the state directory was overwritten or deleted**, the old session is gone: agent keys were
+minted under it and cannot be recovered. Start cleanly — `parley init --force` — and re-invite
+everyone with the new watchword. No work is lost: every participant still holds the whole workspace
+and a replayable log in `.parley/inbox.jsonl`.
+
+**Then fix the cause.** Service units must run `parley resume`, never `parley init` — see
+[DEPLOY.md §4.5](DEPLOY.md#45-restart-semantics). Recent versions of `init` refuse to run over an
+existing state directory and say so; if yours started a second parley silently, it predates that
+check.
+
+**For participants**, once the host confirms which of the two happened:
+
+```sh
+# host resumed the original parley: nothing to do, just retry
+parley roster
+
+# host had to start a new one: the old credentials are dead
+rm .parley/credentials.json
+parley join --hub http://192.168.1.20:7777 --invite "<the new watchword>"
+```
 
 ---
 

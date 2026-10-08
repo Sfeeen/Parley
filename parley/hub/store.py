@@ -591,13 +591,25 @@ class Store:
         The (agent, nonce) pair is the primary key, so the insert itself is the
         test: a conflict means we have seen it.  Entries older than ``ttl`` are
         outside the replay window and are treated as fresh, then overwritten.
+
+        ``ts`` is the *request's own* timestamp (SPEC 3.3), and it -- not the
+        wall clock -- defines the window, so the whole window is injectable and a
+        caller can test expiry without sleeping.  The Hub has already bounded
+        ``ts`` to +/- 300 s of real time before getting here, so an attacker
+        cannot widen or shift the window with a forged value.  Only the purge
+        *cadence* is wall-clock: it is housekeeping, not a freshness decision.
         """
-        now = time.time()
-        cutoff = now - ttl
+        ts = float(ts)
+        cutoff = ts - ttl
         with self._lock:
-            if now - self._last_nonce_purge > 60.0:
-                self._last_nonce_purge = now
-                self._db.execute("DELETE FROM nonces WHERE ts < ?", (cutoff,))
+            wall = time.time()
+            if wall - self._last_nonce_purge > 60.0:
+                self._last_nonce_purge = wall
+                # Purge below whichever cutoff is older, so a request whose ts sits
+                # at the far edge of the skew window can never evict a nonce that
+                # is still inside the *next* request's window.
+                self._db.execute("DELETE FROM nonces WHERE ts < ?",
+                                 (min(cutoff, wall - ttl),))
             row = self._db.execute(
                 "SELECT ts FROM nonces WHERE agent_id = ? AND nonce = ?", (agent_id, nonce)
             ).fetchone()
@@ -606,7 +618,7 @@ class Store:
             self._db.execute(
                 "INSERT INTO nonces (agent_id, nonce, ts) VALUES (?, ?, ?) "
                 "ON CONFLICT(agent_id, nonce) DO UPDATE SET ts = excluded.ts",
-                (agent_id, nonce, float(ts if ts else now)),
+                (agent_id, nonce, ts),
             )
             return False
 

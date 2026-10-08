@@ -131,9 +131,33 @@ class NoSuchAgent(ParleyError):
     http_status = 404
 
 
+class NoHubState(ParleyError):
+    """Asked to resume a parley whose state directory is absent or unreadable.
+
+    Distinct from ``no_such_session``: that one means "this Hub is running, but
+    not the parley you asked for".  This one means there is nothing here to run.
+    """
+
+    code = "no_hub_state"
+    http_status = 404
+
+
 # -- 409 ---------------------------------------------------------------------
 class SeqConflict(ParleyError):
     code = "seq_conflict"
+    http_status = 409
+
+
+class HubStateExists(ParleyError):
+    """Asked to create a parley where one already lives.
+
+    Refusing is the whole point: ``init`` mints a new session id and root key, so
+    silently overwriting would strand every enrolled agent behind a
+    ``fingerprint_mismatch`` with no way back.  ``resume`` is almost always what
+    the caller meant; ``init --force`` is the deliberate, destructive override.
+    """
+
+    code = "hub_state_exists"
     http_status = 409
 
 

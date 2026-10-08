@@ -51,7 +51,9 @@ log = logging.getLogger("parley.hub.api")
 
 JSON_CT = "application/json; charset=utf-8"
 AUTH_SCHEME = "Parley-HMAC-SHA256"
-#: Alternative host-token carrier; the Deck sends this alongside the header.
+#: The *only* host-token carrier (SPEC §3.7): `Authorization: Parley-Host <tok>`.
+#: Not `?ht=` (it would land in proxy and browser logs) and not a bespoke
+#: `X-Parley-Host-Token` header; any other carrier is ignored.
 HOST_AUTH_SCHEME = "Parley-Host"
 MAX_BATCH = 64
 MAX_EVENTS_LIMIT = 2000
@@ -113,6 +115,18 @@ class MethodNotAllowed(ParleyError):
     http_status = 405
 
 
+class SealedStreamUnsupported(ParleyError):
+    """A sealed request for ``/v1/stream`` (SPEC §3.6).
+
+    ``text/event-stream`` has no sealed framing in PARLEY/1, so the Hub says so
+    in the terms §3.6 pins -- ``422 bad_request`` -- rather than streaming the
+    events in the clear to a caller that believes it is sealed.
+    """
+
+    code = "bad_request"
+    http_status = 422
+
+
 # -------------------------------------------------------------------- helpers
 
 
@@ -163,9 +177,11 @@ _SECRET_QUERY_KEYS = ("vt", "ht", "token", "invite")
 def redact_path(raw: str) -> str:
     """A request target safe to log.
 
-    Viewer and host tokens travel in the query string (a browser's EventSource
-    cannot set headers), so the raw path is credential-bearing.  SPEC §3.7 is
-    explicit that a token must never appear in a log line.
+    A viewer token travels in the query string (a browser's EventSource cannot
+    set headers), so the raw path is credential-bearing.  SPEC §3.7 is explicit
+    that a token must never appear in a log line.  ``ht`` stays in the redaction
+    list even though the Hub no longer accepts a host token there: an older
+    client may still send one, and the point is to keep it out of the log.
     """
     if "?" not in raw:
         return raw
@@ -257,18 +273,25 @@ def authenticate(
     secret into an exception message.
     """
     hdr = lower_headers(headers)
-    _, query = split_path(path)
+    bare_path, query = split_path(path)
     policy = dict(getattr(config, "policy", {}) or {})
     skew_s = float(policy.get("skew_s", 300) or 300)
     nonce_ttl = float(policy.get("nonce_ttl_s", 600) or 600)
 
-    # 1. Host token -- header, `Authorization: Parley-Host <tok>`, or `?ht=`
-    #    (the Deck is a browser and cannot set headers on a plain navigation).
-    host_token = hdr.get("x-parley-host-token") or query.get("ht") or ""
-    if not host_token:
-        authz_probe = hdr.get("authorization", "")
-        if authz_probe.startswith(HOST_AUTH_SCHEME + " "):
-            host_token = authz_probe[len(HOST_AUTH_SCHEME) + 1:].strip()
+    # 0. SPEC §3.6: there is no sealed framing for text/event-stream, so a
+    #    sealed client must long-poll instead.  Refuse before authenticating:
+    #    the answer does not depend on the credential, and a client that gets a
+    #    401 here would "fix" its signing instead of its transport choice.
+    _reject_sealed_stream(bare_path, hdr)
+
+    # 1. Host token -- `Authorization: Parley-Host <tok>` and nothing else
+    #    (SPEC §3.7).  A query parameter would land in proxy and browser logs,
+    #    and a second bespoke header would eventually diverge from this one, so
+    #    any other carrier is ignored rather than accepted.
+    host_token = ""
+    authz_probe = hdr.get("authorization", "")
+    if authz_probe.startswith(HOST_AUTH_SCHEME + " "):
+        host_token = authz_probe[len(HOST_AUTH_SCHEME) + 1:].strip()
     if host_token:
         expected = str(getattr(config, "host_token", "") or "")
         if expected and hmac.compare_digest(host_token, expected):
@@ -408,36 +431,76 @@ def authenticate(
 # ------------------------------------------------------- sealed mode (SPEC §3.6)
 
 
-def _seal_aad_candidates(method: str, raw_path: str, hdr: Dict[str, str],
-                         session: str, outer: bytes) -> List[bytes]:
-    """AADs we will try when decrypting a sealed request body.
+def _reject_sealed_stream(bare_path: str, hdr: Dict[str, str]) -> None:
+    """Refuse ``/v1/stream`` when the caller claims sealed mode (SPEC §3.6).
 
-    SPEC §3.6 says the AAD is "the string_to_sign of §3.3", but §3.3's string
-    embeds ``sha256(body)`` -- and the Hub cannot hash the plaintext before it has
-    decrypted it.  Read literally the requirement is circular, so the Hub accepts
-    the three non-circular readings and lets the Poly1305 tag pick the right one.
-    A wrong AAD simply fails authentication, so trying several is not a weakening.
-
-    The canonical form (first, and the one the Hub uses for responses' sibling
-    computation) replaces the body hash with the hash of an empty body: it is
-    computable identically on both sides and still binds the ciphertext to
-    method, path, timestamp, nonce and identity, which is §3.6's stated purpose.
+    Called from :func:`authenticate`, which is the one funnel both the router and
+    ``server.py``'s SSE handler pass through, so the rule holds for every verb.
     """
-    ts = hdr.get("x-parley-timestamp", "")
-    nonce = hdr.get("x-parley-nonce", "")
-    agent = hdr.get("x-parley-agent", "")
-    return [
-        crypto.string_to_sign(method, raw_path, b"", ts, nonce, session, agent),
-        crypto.string_to_sign(method, raw_path, outer, ts, nonce, session, agent),
-        b"",
-    ]
+    if bare_path == "/v1/stream" and hdr.get("x-parley-seal"):
+        raise SealedStreamUnsupported(
+            "there is no sealed framing for text/event-stream in " + WIRE_VERSION,
+            hint="A sealed client long-polls instead: GET /v1/events?since=<seq>&wait=25. "
+            "Its response body travels through the ordinary sealed path.",
+        )
 
 
-def _unseal_request_body(hub, method: str, raw_path: str, hdr: Dict[str, str],
-                         body: bytes) -> Tuple[bytes, bytes]:
-    """-> (plaintext, the seal key that worked)."""
-    session = str(getattr(hub.config, "session", ""))
-    candidates = _seal_aad_candidates(method, raw_path, hdr, session, body)
+def _seal_binding(hub, method: str, raw_path: str, hdr: Dict[str, str]) -> Dict[str, str]:
+    """The six fields SPEC §3.6 binds a sealed body to, as the Hub saw them.
+
+    Kept as a dict rather than two pre-built byte strings because the response
+    AAD is built from exactly the same values, just with the ``-RESPONSE``
+    prefix -- holding the fields makes it impossible for the two to drift.
+    """
+    return {
+        "method": method.upper(),
+        "path": raw_path,
+        "ts": hdr.get("x-parley-timestamp", ""),
+        "nonce": hdr.get("x-parley-nonce", ""),
+        "session": str(getattr(hub.config, "session", "")),
+        "agent": hdr.get("x-parley-agent", ""),
+    }
+
+
+def _seal_aad(binding: Dict[str, str], *, response: bool) -> bytes:
+    return crypto.seal_aad(
+        binding["method"], binding["path"], binding["ts"], binding["nonce"],
+        binding["session"], binding["agent"], response=response,
+    )
+
+
+def _response_seal_key(hub) -> bytes:
+    """The seal key to answer a *bodyless* sealed request with.
+
+    With no ciphertext to open there is nothing to identify which retained root
+    key (§3.8) the caller holds, so the current one is used.  In the window after
+    a watchword rotation an agent still on the previous root key will fail to
+    open such a response; it re-derives on its next `parley join`, and the
+    alternative -- answering a sealed read in the clear -- would leak exactly the
+    event bodies sealed mode exists to protect.
+    """
+    keys = hub.seal_keys()
+    if not keys:
+        raise BadRequest(
+            "this Hub cannot seal responses",
+            hint="The Hub state directory has no root key; re-run `parley init`.",
+        )
+    return keys[0]
+
+
+def _unseal_request_body(hub, binding: Dict[str, str], body: bytes) -> Tuple[bytes, bytes]:
+    """Decrypt one sealed request body.  -> ``(plaintext, the seal key that worked)``.
+
+    Exactly **one** AAD is tried: the §3.6 binding for this request.  SPEC §3.6
+    forbids probing several candidates -- a wrong AAD does fail the Poly1305 tag,
+    so probing looks free, but it silently papers over an interoperability bug
+    instead of surfacing it, and the two implementations then drift for good.
+
+    Several *keys* may still be tried: §3.8 has the Hub retain the last three
+    root keys across a watchword rotation so already-enrolled sealed agents keep
+    working.  That is a key-lifetime question, not an AAD ambiguity.
+    """
+    aad = _seal_aad(binding, response=False)
     keys = hub.seal_keys()
     if not keys:
         raise BadRequest(
@@ -445,15 +508,17 @@ def _unseal_request_body(hub, method: str, raw_path: str, hdr: Dict[str, str],
             hint="The Hub state directory has no root key; re-run `parley init`.",
         )
     for key in keys:
-        for aad in candidates:
-            try:
-                return crypto.unseal(key, body, aad), key
-            except Exception:  # noqa: BLE001 - a tag failure is the probe result
-                continue
+        try:
+            return crypto.unseal(key, body, aad), key
+        except Exception:  # noqa: BLE001 - try the next retained root key
+            continue
     raise BadRequest(
         "could not decrypt the sealed request body",
-        hint="Check that the client and the Hub derived seal_key from the same "
-        "watchword. If the host rotated the watchword, re-run `parley join`.",
+        hint="The AAD of SPEC §3.6 is 'PARLEY/1-SEAL', method, path-with-query, "
+        "timestamp, nonce, session and agent joined by '\\n' -- not the §3.3 "
+        "string-to-sign. Check that too, then check that the client and the Hub "
+        "derived seal_key from the same watchword; if the host rotated the "
+        "watchword, re-run `parley join`.",
     )
 
 
@@ -487,15 +552,17 @@ def handle(hub, method: str, path: str, headers: Mapping[str, str], body: bytes)
 def _maybe_seal(seal: Dict[str, Any], status: int, headers: Dict[str, str], body: bytes):
     """Encrypt a response body when the request arrived sealed.
 
-    The response AAD is empty: SPEC §3.6 specifies an AAD for the *request* and
-    is silent about the response, and an empty AAD is the one value both ends can
-    agree on without another round of circular derivation.  Confidentiality and
-    integrity still come from the AEAD itself.
+    The response AAD is the §3.6 binding of the *request* that produced it, with
+    the ``PARLEY/1-SEAL-RESPONSE`` prefix: same method, path, timestamp, nonce,
+    session and agent.  Reusing the request's timestamp and nonce is what ties a
+    response to one specific request, and the differing prefix is what stops a
+    captured response body from being replayed as a request body.
     """
     if not seal.get("on") or not body:
         return status, headers, body
     try:
-        sealed_body = crypto.seal(seal["key"], body, b"")
+        sealed_body = crypto.seal(seal["key"], body,
+                                  _seal_aad(seal["binding"], response=True))
     except Exception:
         log.exception("could not seal the response body; refusing to send it in the clear")
         return 500, headers, b""
@@ -541,8 +608,9 @@ def _route(hub, method: str, raw_path: str, headers: Mapping[str, str], body: by
     if path.startswith("/v1/admin/") and not _has_host_credential(hdr, query):
         raise HostTokenRequired(
             "admin actions need the host token",
-            hint="Pass it as `X-Parley-Host-Token:` or `?ht=`; it is printed once at "
-            "`parley init` and stored in the Hub state directory.",
+            hint="Pass it as `Authorization: Parley-Host <token>` -- the only carrier "
+            "SPEC §3.7 allows; it is printed once at `parley init` and stored in "
+            "the Hub state directory.",
         )
 
     auth = authenticate(hub.store, hub.config, method, raw_path, headers, body)
@@ -568,10 +636,18 @@ def _route(hub, method: str, raw_path: str, headers: Mapping[str, str], body: by
     # endpoints; everything else is one sealed envelope around the JSON body.
     seal_hdr = hdr.get("x-parley-seal", "")
     is_blob_path = path == "/v1/blobs" or path.startswith("/v1/blobs/")
-    if seal_hdr and kind in ("agent", "enroll") and not is_blob_path and body:
-        body, seal_key = _unseal_request_body(hub, method, raw_path, hdr, body)
+    if seal_hdr and kind in ("agent", "enroll") and not is_blob_path:
+        binding = _seal_binding(hub, method, raw_path, hdr)
+        if body:
+            body, seal_key = _unseal_request_body(hub, binding, body)
+        else:
+            # A sealed GET has no body to open, but its *response* must still be
+            # sealed -- §3.6 routes a sealed client's long-poll reads through
+            # "the ordinary sealed path", and that is where the event bodies are.
+            seal_key = _response_seal_key(hub)
         seal["on"] = True
         seal["key"] = seal_key
+        seal["binding"] = binding
     elif (
         hub.policy.get("sealed")
         and kind in ("agent", "enroll")
@@ -652,8 +728,9 @@ def _route(hub, method: str, raw_path: str, headers: Mapping[str, str], body: by
         if kind != "host":
             raise HostTokenRequired(
                 "admin actions need the host token",
-                hint="Pass it as `X-Parley-Host-Token:` or `?ht=`; it is printed once at "
-                "`parley init` and stored in the Hub state directory.",
+                hint="Pass it as `Authorization: Parley-Host <token>` -- the only carrier "
+                "SPEC §3.7 allows; it is printed once at `parley init` and stored in "
+                "the Hub state directory.",
             )
         if method != "POST":
             raise MethodNotAllowed("POST only", hint="All /v1/admin/* actions are POST.")
@@ -668,8 +745,7 @@ def _route(hub, method: str, raw_path: str, headers: Mapping[str, str], body: by
 
 
 def _has_host_credential(hdr: Dict[str, str], query: Dict[str, str]) -> bool:
-    if hdr.get("x-parley-host-token") or query.get("ht"):
-        return True
+    """SPEC §3.7: the host token has exactly one carrier, so this looks in one place."""
     return hdr.get("authorization", "").startswith(HOST_AUTH_SCHEME + " ")
 
 
@@ -972,13 +1048,18 @@ def _post_blob(hub, agent_id: str, hdr: Dict[str, str], body: bytes):
 
 
 def _unseal_frames(hub, body: bytes, declared: str) -> bytes:
-    """Decrypt a frame-sealed blob upload, trying each live seal key."""
+    """Decrypt a frame-sealed blob upload.
+
+    One AAD per frame -- ``b"parley/blob/v1" || sha256:<hex> || index`` (SPEC
+    §3.6), never a set of candidates.  Several *keys* are tried only because §3.8
+    has the Hub retain the last three root keys across a watchword rotation.
+    """
     wire = wire_blob_hash(declared)
     last = None
     for key in hub.seal_keys():
         try:
             return crypto.unseal_frames(key, body, wire)
-        except Exception as exc:  # noqa: BLE001 - tag failure is the probe result
+        except Exception as exc:  # noqa: BLE001 - try the next retained root key
             last = exc
     raise BadRequest(
         "could not decrypt the sealed blob",
