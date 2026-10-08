@@ -15,11 +15,57 @@ Success = a stranger's agent, given only the repo URL and a spoken watchword, is
 correctly without a human writing any glue code.
 
 ## Status
-- Spec written and frozen as the build contract: `docs/SPEC.md` (PARLEY/1).
-- Project scaffolding + git repo created.
-- Builders fanned out across the six components (crypto/protocol, hub, client/sync, Deck,
-  ledger/tests, docs/scripts).
-- Nothing pushed to GitHub yet — repo exists locally only, `gh` is not installed on this box.
+**Wave 1 complete. PAUSED at Sven's instruction — do not start wave 2 without his word.**
+
+- `docs/SPEC.md` (PARLEY/1) is the frozen build contract; `docs/INTERNAL-API.md` pins module signatures.
+- All seven wave-1 components built and integrated: foundations/crypto, hub, client/sync, the Deck,
+  ledger, CLI/doctor, docs/scripts. 115 files, ~34k lines.
+- **Test suite: 527 tests, 6 failures** (`python3 -m unittest discover -s tests`, ~76 s).
+  All 6 failures are one defect — see Next steps #1.
+- Verified working end-to-end for real: `parley init` → `parley join` ×2 → two `parley run`
+  daemons → two-way file sync (exec bit + byte-identical binaries), pigeonhole chat, clean
+  SIGTERM with `agent.bye`. `parley doctor` 18/18 from a guest. `--discover` finds the Hub over UDP.
+- The Deck was verified in headless Chromium: renders 1440/1280/390 px in both themes, zero
+  off-origin requests, XSS attacks in the fixture all neutralised, reconnect state machine walks
+  live → reconnecting → long-poll → recovery against a killed Hub.
+- **The Exchange (SPEC §15) is specced but NOT implemented.** That is wave 2.
+- Nothing pushed to GitHub — repo is local only, `gh` is not installed on this box.
+
+## Open defects (wave 1)
+1. **`protocol.normalise_path` is non-conformant** — silently rewrites `.` segments and
+   backslashes instead of rejecting them (SPEC §7.1 says MUST reject). Causes all 6 test
+   failures. Not a containment hole (`safe_join` still resolves and verifies), but two agents
+   can address one file by two spellings. One-line-ish fix in `parley/protocol.py`.
+2. **Sealed mode is broken** — hub and client disagree on the enrolment body AAD, so
+   `init --seal` + `join --seal` fails with `400 could not decrypt`. Root cause is a spec bug:
+   §3.6's AAD is circular (it embeds `sha256(body)`, which the Hub cannot compute before
+   decrypting). Both sides invented different non-circular readings. Fix the spec first, then
+   make both sides agree. This is the no-TLS internet path, so it matters.
+3. **Restart trap** — `parley init` mints a NEW session every run, so a systemd
+   `Restart=on-failure` silently starts a *different* parley and every client fails with
+   `fingerprint_mismatch`. Needs `parley resume` or `init --reuse`. Flagged in DEPLOY.md §4.5.
+4. **Host token is sent two ways** by both the CLI and the Deck (`X-Parley-Host-Token` and
+   `Authorization: Parley-Host`). Pick one server-side, delete the other.
+5. `Store.seen_nonce` ignores its injected `ts` and uses `time.time()` — not exploitable,
+   but makes TTL expiry untestable except by back-dating stored rows.
+6. `invite --reveal` cannot work as specced (Hub stores only the root key + a hash). It exits
+   honestly pointing at `--rotate`. Decide whether to drop it from SPEC §11 or retain plaintext.
+7. `init --json` puts `host_token` in the same envelope as the watchword — review.
+8. Unverified: `tunnel.sh` provider branches, both `.ps1` scripts (no pwsh here), any browser
+   but Chromium, the public-exposure warning branch (no public address on this box).
+
+## Spec defects found by implementing it (fix in SPEC.md)
+- §3.6 sealed AAD is circular — unimplementable as written (see defect 2).
+- §2 clock-skew `ts` rewrite invalidates the author's `sig`. Hub's resolution: verify over bytes
+  as received, rewrite, record `body._original_ts`, re-sign with the Hub-minted key. Spec this.
+- §3.5 vs §3.8 contradict: rotating the watchword changes the fingerprint, but §3.5 calls a
+  changed fingerprint a hard error. Hub announces old→new in a signed `hub.notice` and keeps the
+  last 3 root keys. Spec this.
+- §3.5 never said how 6 fingerprint bytes become 3 words. Implemented as three 2-byte big-endian
+  chunks mod 2048 (unbiased, since 65536 % 2048 == 0). Pin it.
+- §7.1 PBKDF2 salt encoding was implicit — it is UTF-8 of the full `ses_`-prefixed id.
+- §11 omits `--discover`, which is implemented. `POST /v1/admin/reveal` is called by the Deck but
+  is not in §5.
 
 ## Key decisions
 - **Name:** Parley. Vocabulary: a *parley* (session), the *Hub* (server), the *watchword*
@@ -45,11 +91,13 @@ correctly without a human writing any glue code.
 - **The Ledger is explainable by rule.** Fixed, published, user-overridable weights; every point
   traceable to an event. It measures recorded contribution, not quality, and says so.
 
-## Next steps
-1. Integrate the six builders' output; resolve interface mismatches against `docs/SPEC.md`.
-2. Run the full test suite + a real two-participant loopback session end-to-end.
-3. Visual pass on the Deck with live data.
-4. Decide the GitHub org/account and push (needs Sven — `gh` not installed, no credentials here).
+## Next steps (all gated on Sven's go-ahead — he asked to pause after wave 1)
+1. Fix `protocol.normalise_path` → 527/527 green.
+2. Fix the §3.6 sealed-AAD spec bug, then make hub and client agree; sealed mode end-to-end.
+3. Close the remaining wave-1 defects above (restart/resume, host-token duplication, seen_nonce).
+4. Wave 2: implement the Exchange (SPEC §15) across hub, client, Deck, CLI, ledger, docs.
+5. Decide the GitHub org, find-and-replace the `<org>/parley` placeholder, push.
+   Needs Sven — `gh` is not installed and there are no credentials here.
 
 ## Notes
 - Build contract is `docs/SPEC.md`. If code and spec disagree, the spec wins — fix the code.

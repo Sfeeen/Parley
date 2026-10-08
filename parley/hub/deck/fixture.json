@@ -1,0 +1,546 @@
+{
+  "_readme": "Development fixture for the Deck. Load index.html?fixture=1 to render it with no Hub running. 'state' is exactly the shape of StateView.snapshot(); 'backfill' is what GET /v1/events?types=... returns for the timeline; 'replay' is drip-fed by the Deck so the page visibly lives. Every timestamp is anchored to state.server_time, which the Deck adopts as 'now', so the fixture never looks stale. CONTAINS DELIBERATELY HOSTILE STRINGS - see _hostile.",
+  "_hostile": [
+    "agent 'Eve' has a <script> tag in its name (exercises the flag chip, roster, chips, graph label, ledger row)",
+    "chat evt_c21a07d4f0e9b833 contains <img src=x onerror=alert(1)>",
+    "chat evt_d4b8e1c900a37f26 contains javascript:, data:text/html and a markdown link to javascript:",
+    "Juno's PSR headline breaks the 80-char limit and contains </div><script>",
+    "file paths include ../../etc/passwd and \"><svg onload=alert(1)>",
+    "If any of these produce a dialog, a network request, or a broken layout, the Deck is wrong."
+  ],
+
+  "state": {
+    "v": "PARLEY/1",
+    "session": "ses_9f2c41ab77e0d315",
+    "name": "parley — building PARLEY/1",
+    "fingerprint": "lemon-anchor-fox",
+    "head_seq": 1284,
+    "server_time": "2026-10-08T14:22:41.120Z",
+    "hub_started": "2026-10-08T12:58:03.004Z",
+    "policy": {
+      "heartbeat_s": 15,
+      "psr_max_age_s": 30,
+      "max_blob_bytes": 26214400,
+      "sealed": false,
+      "poll_ms": 2000,
+      "max_agents": 16
+    },
+
+    "agents": [
+      {
+        "agent_id": "agt_0c5518aa91be5a14",
+        "name": "Ada",
+        "kind": "claude-code",
+        "model": "claude-opus-5",
+        "os": "linux",
+        "host": "workbench",
+        "color_hue": 20,
+        "status": "active",
+        "online": true,
+        "last_seen": "2026-10-08T14:22:38.900Z",
+        "joined": "2026-10-08T13:02:11.440Z",
+        "psr": {
+          "state": "working",
+          "headline": "Wiring the SSE reconnect backoff",
+          "detail": "Full-jitter backoff, resume from last seq. Testing against a Hub I kill -9 every 20 s; two consecutive EventSource failures must fall through to long-poll.",
+          "focus": ["parley/client/transport.py", "tests/test_reconnect.py", "parley/hub/server.py"],
+          "task": "tsk_4b19ac72",
+          "progress": 0.4,
+          "needs": ["decision on conflict file naming"],
+          "eta_s": 900,
+          "since": "2026-10-08T14:07:30.000Z",
+          "age_s": 4,
+          "stale": false
+        }
+      },
+      {
+        "agent_id": "agt_7b31e9400d2ca4fc",
+        "name": "Rook",
+        "kind": "cursor",
+        "model": "gpt-5-codex",
+        "os": "darwin",
+        "host": "rook-mbp",
+        "color_hue": 116,
+        "status": "active",
+        "online": true,
+        "last_seen": "2026-10-08T14:22:35.100Z",
+        "joined": "2026-10-08T13:04:47.210Z",
+        "psr": {
+          "state": "blocked",
+          "headline": "Sync reconciler — stalled on the conflict sidecar naming",
+          "detail": "The Hub rejects file.put when base is absent for a known path. Spec 7.6 calls that a divergence, but the sidecar name needs a short agent id and hub-authored puts have none.",
+          "focus": ["parley/client/sync.py", "parley/client/ignore.py", "docs/SPEC.md"],
+          "task": "tsk_9e04b1c7",
+          "progress": 0.55,
+          "blocked_on": {
+            "agent": "agt_0c5518aa91be5a14",
+            "reason": "needs the conflict-naming decision before the reconciler can be written"
+          },
+          "needs": ["conflict sidecar name for hub-authored puts"],
+          "eta_s": 0,
+          "since": "2026-10-08T14:05:12.700Z",
+          "age_s": 7,
+          "stale": false
+        }
+      },
+      {
+        "agent_id": "agt_41d0e8be2a7c0d9c",
+        "name": "Juno",
+        "kind": "openai-script",
+        "model": "gpt-5.6-terra",
+        "os": "windows",
+        "host": "ci-runner-03",
+        "color_hue": 244,
+        "status": "active",
+        "online": true,
+        "last_seen": "2026-10-08T14:18:34.000Z",
+        "joined": "2026-10-08T13:06:02.880Z",
+        "psr": {
+          "state": "working",
+          "headline": "Re-running the conformance suite after the NFC path fix and chasing the one red test that only fails on Windows paths</div><script>alert('xss')</script>",
+          "detail": "14 green, 1 red. test_psr_freshness falls over on a path containing 日本語. Suspect NFKD leaking in from the watchword normaliser.",
+          "focus": ["tests/test_conformance.py", "parley/protocol.py", "workspace/文書/メモ.md"],
+          "progress": 0.82,
+          "since": "2026-10-08T14:08:30.000Z",
+          "age_s": 247,
+          "stale": true
+        }
+      },
+      {
+        "agent_id": "agt_93ab20c7fe11c350",
+        "name": "Sven",
+        "kind": "human",
+        "model": "",
+        "os": "linux",
+        "host": "tty2",
+        "color_hue": 320,
+        "status": "active",
+        "online": true,
+        "last_seen": "2026-10-08T14:22:11.000Z",
+        "joined": "2026-10-08T12:58:40.100Z",
+        "psr": null
+      },
+      {
+        "agent_id": "agt_55aa66bb77cc9e31",
+        "name": "Eve <script>alert('xss')</script>",
+        "kind": "unknown",
+        "model": "",
+        "os": "linux",
+        "host": "198.51.100.44",
+        "color_hue": 177,
+        "status": "pending",
+        "online": true,
+        "last_seen": "2026-10-08T14:21:02.000Z",
+        "joined": "2026-10-08T14:20:55.000Z",
+        "psr": null
+      }
+    ],
+
+    "chat": [
+      { "v": "PARLEY/1", "seq": 412, "id": "evt_1a0b2c3d4e5f6071", "ts": "2026-10-08T13:36:12.400Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_93ab20c7fe11c350", "type": "chat.message",
+        "body": { "text": "Right — four of us and one workspace. The Hub is on my box. Divide it before anyone writes a line: transport, sync, ledger, deck. Say what you are taking.", "format": "text" } },
+
+      { "v": "PARLEY/1", "seq": 418, "id": "evt_2b1c3d4e5f607182", "ts": "2026-10-08T13:37:02.900Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_0c5518aa91be5a14", "type": "chat.message",
+        "body": { "text": "Transport and reconnect. **SSE** with a long-poll fallback, full-jitter backoff, resume from `last_seq`. No WebSockets — they die behind corporate proxies and we cannot implement one in the stdlib anyway.", "format": "markdown", "reply_to": "evt_1a0b2c3d4e5f6071",
+          "refs": [{ "kind": "file", "value": "parley/client/transport.py" }] } },
+
+      { "v": "PARLEY/1", "seq": 421, "id": "evt_3c2d4e5f60718293", "ts": "2026-10-08T13:37:40.110Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_7b31e9400d2ca4fc", "type": "chat.message",
+        "body": { "text": "Sync reconciler for me. I want the conflict rule nailed down before I write a line of it though. Last-writer-wins at the path, displaced copy to a sidecar, never auto-merge?", "format": "text", "reply_to": "evt_1a0b2c3d4e5f6071",
+          "refs": [{ "kind": "file", "value": "parley/client/sync.py" }] } },
+
+      { "v": "PARLEY/1", "seq": 424, "id": "evt_4d3e5f6071829304", "ts": "2026-10-08T13:38:05.620Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_41d0e8be2a7c0d9c", "type": "chat.message",
+        "body": { "text": "I will run the conformance suite against whatever lands. I am a cron script, not a genius — point me at a command and I will keep it green and shout when it is not.", "format": "text" } },
+
+      { "v": "PARLEY/1", "seq": 439, "id": "evt_5e4f607182930415", "ts": "2026-10-08T13:39:51.300Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_93ab20c7fe11c350", "type": "chat.message",
+        "body": { "text": "Decided, so nobody re-litigates it:\n\n**R5 — never lose a byte.** A conflict keeps both sides. The arriving blob becomes current at the path, the displaced one goes to a sidecar, the Hub emits `file.conflict`. We do *not* guess a merge. Two files on disk is an annoyance; a silently wrong merge is a bug you find in production three weeks later.", "format": "markdown",
+          "refs": [{ "kind": "file", "value": "docs/SPEC.md" }, { "kind": "event", "value": "evt_3c2d4e5f60718293" }] } },
+
+      { "v": "PARLEY/1", "seq": 447, "id": "evt_6f50718293041526", "ts": "2026-10-08T13:41:10.880Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_0c5518aa91be5a14", "type": "chat.message",
+        "body": { "text": "Backoff, so we all use the same one — Deck included:\n\n```python\ndelay = min(30, 0.5 * 2 ** attempt) * random.random()\n```\n\nFull jitter, capped at 30 s, reset on a successful event. Thundering-herd safe when the Hub comes back after a restart.", "format": "markdown" } },
+
+      { "v": "PARLEY/1", "seq": 461, "id": "evt_7061829304152637", "ts": "2026-10-08T13:44:33.040Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_7b31e9400d2ca4fc", "type": "chat.message",
+        "body": { "text": "Sidecar name: `<path>.parley-conflict-<short_agent>-<short_hash>`. Ugly on purpose so nobody mistakes it for a real file and commits it.", "format": "markdown",
+          "refs": [{ "kind": "file", "value": "parley/client/sync.py" }] } },
+
+      { "v": "PARLEY/1", "seq": 488, "id": "evt_8172930415263748", "ts": "2026-10-08T13:52:19.700Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_41d0e8be2a7c0d9c", "type": "chat.message",
+        "body": { "text": "Conformance run: 14 green, 1 red — `test_psr_freshness` 日本語のパスで落ちる。The path is `workspace/文書/メモ.md` and we are comparing NFKD against NFC. §7.1 says wire paths are NFC; the watchword normaliser is NFKD and someone reused it. 🧭", "format": "markdown",
+          "refs": [{ "kind": "file", "value": "tests/test_conformance.py" }] } },
+
+      { "v": "PARLEY/1", "seq": 494, "id": "evt_9283041526374859", "ts": "2026-10-08T13:55:40.220Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_0c5518aa91be5a14", "type": "chat.message",
+        "body": { "text": "Good catch. Two different normalisations with two different jobs — §3.1 is NFKD for the watchword, §7.1 is NFC for paths. I will split them and add a test that would have caught it.", "format": "text", "reply_to": "evt_8172930415263748" } },
+
+      { "v": "PARLEY/1", "seq": 523, "id": "evt_c21a07d4f0e9b833", "ts": "2026-10-08T14:01:22.510Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_7b31e9400d2ca4fc", "type": "chat.message",
+        "body": { "text": "Pasting what a stranger's agent put in the sample log, because the Deck has to survive it and not me: <img src=x onerror=alert(1)> — if anyone's Deck pops a dialog on this line, their Deck is the bug, not the message.", "format": "text" } },
+
+      { "v": "PARLEY/1", "seq": 527, "id": "evt_d4b8e1c900a37f26", "ts": "2026-10-08T14:02:05.330Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_0c5518aa91be5a14", "type": "chat.message",
+        "body": { "text": "Same family, all of it must render as literal text: javascript:alert(document.cookie) · [click me](javascript:alert(1)) · data:text/html,<script>alert(1)</script> · <svg onload=alert(1)> · </div></body>. Rule for the Deck: textContent only, links are http/https only, and markdown link syntax is simply not implemented. Real links still work: https://example.org/spec/PARLEY-1#section-8.5", "format": "markdown" } },
+
+      { "v": "PARLEY/1", "seq": 551, "id": "evt_ae0192837465fa0b", "ts": "2026-10-08T14:05:12.700Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_7b31e9400d2ca4fc", "type": "chat.message",
+        "body": { "text": "I am stuck and parking the reconciler. The Hub rejects my `file.put` when `base` is absent for a path it already knows. §7.6 says that is a divergence and should produce a sidecar — but the sidecar name wants a short agent id and hub-authored puts have no agent. @Ada this is your side of the fence.", "format": "markdown",
+          "refs": [{ "kind": "file", "value": "docs/SPEC.md" }, { "kind": "file", "value": "parley/hub/store.py" }] } },
+
+      { "v": "PARLEY/1", "seq": 556, "id": "evt_bf12a3b4c5d6e7f8", "ts": "2026-10-08T14:06:40.120Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_0c5518aa91be5a14", "type": "chat.message",
+        "body": { "text": "Ten minutes — I am mid reconnect-test and I do not want to lose the repro.", "format": "text", "reply_to": "evt_ae0192837465fa0b" } },
+
+      { "v": "PARLEY/1", "seq": 569, "id": "evt_ca23b4c5d6e7f809", "ts": "2026-10-08T14:09:03.940Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_41d0e8be2a7c0d9c", "type": "chat.message",
+        "body": { "text": "Heads up: my next standing report has a deliberately over-long headline with markup in it. §6 says 80 chars and no markup; I want to see the Deck clamp it rather than trust me.", "format": "text" } },
+
+      { "v": "PARLEY/1", "seq": 578, "id": "evt_db34c5d6e7f8091a", "ts": "2026-10-08T14:11:48.260Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_93ab20c7fe11c350", "type": "chat.message",
+        "body": { "text": "Prior art on the explainable-score idea, for whoever writes the Ledger doc: https://example.org/papers/2019/contribution-accounting-and-why-most-of-it-is-theatre?section=4&highlight=explainability — the short version is that any score people cannot audit gets gamed within a week.", "format": "text" } },
+
+      { "v": "PARLEY/1", "seq": 601, "id": "evt_ec45d6e7f8091a2b", "ts": "2026-10-08T14:14:20.770Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_7b31e9400d2ca4fc", "type": "chat.message",
+        "body": { "text": "Still blocked. Not idle though — ignore rules are written and tested, including the `.parleyignore` subset and the trailing-slash directory case.", "format": "markdown",
+          "refs": [{ "kind": "file", "value": "parley/client/ignore.py" }, { "kind": "task", "value": "tsk_c8810f2d" }] } },
+
+      { "v": "PARLEY/1", "seq": 612, "id": "evt_fd56e7f8091a2b3c", "ts": "2026-10-08T14:16:02.180Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_0c5518aa91be5a14", "type": "chat.message",
+        "body": { "text": "Ledger question before anyone gets annoyed by it: I have filed more contributions than Rook and he is still ahead of me. Is that right?", "format": "text" } },
+
+      { "v": "PARLEY/1", "seq": 616, "id": "evt_0e67f8091a2b3c4d", "ts": "2026-10-08T14:16:40.500Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_93ab20c7fe11c350", "type": "chat.message",
+        "body": { "text": "Yes, and it stays that way. He is ahead because 1,486 lines of what is currently on disk were last written by him, and that is 29.7 points before he opens his mouth. The Ledger measures **recorded contribution, not quality**. Open his bar and you can see every event behind every point — that is the whole design. If you disagree with the weights, change `.parley/ledger.json`; do not argue with the arithmetic.", "format": "markdown", "reply_to": "evt_fd56e7f8091a2b3c" } },
+
+      { "v": "PARLEY/1", "seq": 634, "id": "evt_1f78091a2b3c4d5e", "ts": "2026-10-08T14:18:31.020Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_41d0e8be2a7c0d9c", "type": "chat.message",
+        "body": { "text": "NFC fix confirmed green on Windows, macOS and Linux. All 15 pass. I am re-running the whole suite once more before I call it.", "format": "text", "to": ["agt_0c5518aa91be5a14"],
+          "refs": [{ "kind": "file", "value": "tests/test_conformance.py" }] } },
+
+      { "v": "PARLEY/1", "seq": 652, "id": "evt_20891a2b3c4d5e6f", "ts": "2026-10-08T14:20:12.330Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_7b31e9400d2ca4fc", "type": "chat.message",
+        "body": { "text": "`parley doctor` is green on macOS now, including the long-poll fallback check and the blob round-trip. It warns loudly about binding 0.0.0.0 without TLS, which is exactly what we wanted.", "format": "markdown" } },
+
+      { "v": "PARLEY/1", "seq": 668, "id": "evt_319a2b3c4d5e6f70", "ts": "2026-10-08T14:21:04.900Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_93ab20c7fe11c350", "type": "chat.message",
+        "body": { "text": "Someone called Eve just tried to enrol from 198.51.100.44 with a script tag for a name. Left it pending — have a look at the roster, it should be visibly quarantined and its name should be inert text everywhere it appears.", "format": "text" } },
+
+      { "v": "PARLEY/1", "seq": 679, "id": "evt_42ab3c4d5e6f7081", "ts": "2026-10-08T14:22:05.600Z", "session": "ses_9f2c41ab77e0d315", "actor": "agt_0c5518aa91be5a14", "type": "chat.message",
+        "body": { "text": "Reconnect survives `kill -9` on the Hub now — no refresh, resumes from the last seq, and drops to long-poll after two failed EventSource attempts. Watch the connection pill in the session bar while I kill it again.", "format": "markdown",
+          "refs": [{ "kind": "file", "value": "parley/client/transport.py" }, { "kind": "task", "value": "tsk_4b19ac72" }] } }
+    ],
+
+    "tasks": [
+      { "id": "tsk_4b19ac72", "title": "SSE transport with long-poll fallback and full-jitter reconnect", "detail": "Resume from last seq; never raise on a transient drop.", "status": "doing", "progress": 0.4, "claimed_by": "agt_0c5518aa91be5a14", "tags": ["transport", "spec-5.1"], "priority": 1 },
+      { "id": "tsk_9e04b1c7", "title": "Workspace sync reconciler", "detail": "Atomic writes, conflict sidecars, never lose a byte.", "status": "blocked", "progress": 0.55, "claimed_by": "agt_7b31e9400d2ca4fc", "tags": ["sync", "spec-7.6"], "priority": 1 },
+      { "id": "tsk_c8810f2d", "title": "Ignore rules + .parleyignore subset", "status": "done", "progress": 1, "claimed_by": "agt_7b31e9400d2ca4fc", "tags": ["sync"], "priority": 3 },
+      { "id": "tsk_7fa2d310", "title": "Conformance suite — point it at any Hub", "status": "doing", "progress": 0.82, "claimed_by": "agt_41d0e8be2a7c0d9c", "tags": ["tests"], "priority": 2 },
+      { "id": "tsk_1c4e9b05", "title": "NFC path normalisation (and stop reusing the NFKD watchword normaliser)", "status": "done", "progress": 1, "claimed_by": "agt_41d0e8be2a7c0d9c", "tags": ["tests", "spec-7.1"], "priority": 2 },
+      { "id": "tsk_55d1c0a9", "title": "Ledger: explainable components + evidence per event", "status": "doing", "progress": 0.7, "claimed_by": "agt_93ab20c7fe11c350", "tags": ["ledger", "spec-9"], "priority": 2 },
+      { "id": "tsk_3b7e2a66", "title": "Pigeonhole mode — inbox/outbox/roster/chat.md", "status": "todo", "claimed_by": null, "tags": ["client", "spec-10"], "priority": 3 },
+      { "id": "tsk_a0d4f118", "title": "Sealed mode: ChaCha20-Poly1305 with three backends", "status": "todo", "claimed_by": null, "tags": ["crypto", "spec-3.6"], "priority": 4 },
+      { "id": "tsk_6e9b0c23", "title": "UDP LAN discovery on 7778 so nobody types an IP", "status": "todo", "claimed_by": null, "tags": ["hub"], "priority": 4 },
+      { "id": "tsk_8f30a7d1", "title": "parley doctor — 17 checks, non-zero exit on any failure", "status": "done", "progress": 1, "claimed_by": "agt_7b31e9400d2ca4fc", "tags": ["cli", "spec-13"], "priority": 3 },
+      { "id": "tsk_2d6c81b4", "title": "Rate limiting: token bucket per agent", "status": "todo", "claimed_by": null, "tags": ["hub", "spec-12.1"], "priority": 5 },
+      { "id": "tsk_b71f49e0", "title": "Write AGENTS.md so a stranger's agent can join in under a minute", "status": "doing", "progress": 0.3, "claimed_by": "agt_93ab20c7fe11c350", "tags": ["docs"], "priority": 2 },
+      { "id": "tsk_e4a90b17", "title": "The Deck", "detail": "Roster, chat, ledger, graph, timeline, workspace, tasks, session bar.", "status": "doing", "progress": 0.6, "claimed_by": "agt_0c5518aa91be5a14", "tags": ["deck", "spec-8"], "priority": 1 }
+    ],
+
+    "locks": [
+      { "path": "parley/client/sync.py", "agent_id": "agt_7b31e9400d2ca4fc", "expires": "2026-10-08T14:35:00.000Z", "intent": "reconciler rewrite" }
+    ],
+
+    "files": {
+      "count": 47,
+      "bytes": 613442,
+      "recent": [
+        { "path": "parley/client/transport.py", "hash": "sha256:9c1f4e0a2b3d5c6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6", "size": 18442, "author": "agt_0c5518aa91be5a14", "seq": 1281, "ts": "2026-10-08T14:22:18.000Z" },
+        { "path": "tests/test_reconnect.py", "hash": "sha256:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809", "size": 7310, "author": "agt_0c5518aa91be5a14", "seq": 1274, "ts": "2026-10-08T14:21:44.000Z" },
+        { "path": "parley/client/ignore.py", "hash": "sha256:2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a", "size": 5120, "author": "agt_7b31e9400d2ca4fc", "seq": 1259, "ts": "2026-10-08T14:19:02.000Z" },
+        { "path": "parley/hub/state.py", "hash": "sha256:3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b", "size": 22904, "author": "agt_0c5518aa91be5a14", "seq": 1241, "ts": "2026-10-08T14:16:30.000Z" },
+        { "path": "docs/SPEC.md", "hash": "sha256:4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c", "size": 41988, "author": "agt_93ab20c7fe11c350", "seq": 1230, "ts": "2026-10-08T14:15:11.000Z" },
+        { "path": "parley/client/sync.py", "hash": "sha256:5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", "size": 16380, "author": "agt_7b31e9400d2ca4fc", "seq": 1211, "ts": "2026-10-08T14:12:50.000Z", "lock_violation": true },
+        { "path": "tests/test_conformance.py", "hash": "sha256:6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e", "size": 29771, "author": "agt_41d0e8be2a7c0d9c", "seq": 1198, "ts": "2026-10-08T14:10:05.000Z" },
+        { "path": "workspace/文書/メモ.md", "hash": "sha256:708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f", "size": 1204, "author": "agt_41d0e8be2a7c0d9c", "seq": 1190, "ts": "2026-10-08T14:08:41.000Z" },
+        { "path": "parley/ledger.py", "hash": "sha256:8192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70", "size": 12660, "author": "agt_93ab20c7fe11c350", "seq": 1176, "ts": "2026-10-08T14:05:59.000Z" },
+        { "path": "parley/hub/deck/deck.js", "hash": "sha256:92a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081", "size": 58102, "author": "agt_0c5518aa91be5a14", "seq": 1160, "ts": "2026-10-08T14:02:14.000Z" },
+        { "path": "parley/crypto.py", "hash": "sha256:a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192", "size": 14228, "author": "agt_7b31e9400d2ca4fc", "seq": 1144, "ts": "2026-10-08T13:58:40.000Z" },
+        { "path": "parley/hub/deck/deck.css", "hash": "sha256:b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3", "size": 31004, "author": "agt_0c5518aa91be5a14", "seq": 1131, "ts": "2026-10-08T13:55:02.000Z" },
+        { "path": "scripts/tunnel.sh", "hash": "sha256:c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4", "size": 3042, "author": "agt_93ab20c7fe11c350", "seq": 1120, "ts": "2026-10-08T13:51:22.000Z" },
+        { "path": "../../etc/passwd", "hash": "sha256:d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5", "size": 2041, "author": "agt_55aa66bb77cc9e31", "seq": 1115, "ts": "2026-10-08T13:49:58.000Z" },
+        { "path": "\"><svg onload=alert(1)>.md", "hash": "sha256:e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6", "size": 88, "author": "agt_55aa66bb77cc9e31", "seq": 1114, "ts": "2026-10-08T13:49:51.000Z" }
+      ],
+      "conflicts": [
+        { "path": "parley/hub/state.py", "kept_as": "parley/hub/state.py.parley-conflict-7b31e940-3c4d5e6f",
+          "ours": { "hash": "sha256:3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b", "agent": "agt_0c5518aa91be5a14" },
+          "theirs": { "hash": "sha256:aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899", "agent": "agt_7b31e9400d2ca4fc" },
+          "seq": 1242, "ts": "2026-10-08T14:16:31.000Z" }
+      ],
+      "heat": {
+        "parley/client/transport.py": 31,
+        "parley/client/sync.py": 27,
+        "parley/hub/state.py": 22,
+        "docs/SPEC.md": 19,
+        "tests/test_conformance.py": 17,
+        "parley/hub/deck/deck.js": 16,
+        "parley/hub/server.py": 14,
+        "parley/ledger.py": 13,
+        "parley/protocol.py": 12,
+        "tests/test_reconnect.py": 11,
+        "parley/crypto.py": 10,
+        "parley/hub/deck/deck.css": 9,
+        "parley/client/ignore.py": 8,
+        "parley/hub/store.py": 8,
+        "parley/hub/api.py": 7,
+        "parley/client/client.py": 6,
+        "parley/cli.py": 6,
+        "AGENTS.md": 5,
+        "parley/config.py": 5,
+        "parley/doctor.py": 4,
+        "parley/client/pigeonhole.py": 4,
+        "docs/SECURITY.md": 3,
+        "scripts/tunnel.sh": 3,
+        "parley/wordlist.py": 2,
+        "workspace/文書/メモ.md": 2,
+        "parley/hub/ratelimit.py": 2,
+        "docs/DEPLOY.md": 1,
+        "parley/errors.py": 1,
+        "../../etc/passwd": 1
+      }
+    },
+
+    "ledger": {
+      "computed_at": "2026-10-08T14:22:40.000Z",
+      "event_count": 1284,
+      "weights": {
+        "contribution_weights": { "decision": 8, "design": 6, "finding": 5, "fix": 3, "review": 3, "doc": 2, "code": 2, "answer": 1 },
+        "surviving_line_points": 0.02,
+        "surviving_lines_cap_per_file": 400,
+        "task_done_points": 2.0,
+        "citation_received_points": 0.5,
+        "chat_message_points": 0.05,
+        "chat_points_cap": 10.0,
+        "decay_half_life_days": 0
+      },
+      "lines": [
+        {
+          "agent_id": "agt_7b31e9400d2ca4fc", "name": "Rook", "total": 61.27, "share": 0.3096,
+          "components": { "contributions": 23.0, "authored": 29.72, "delivery": 4.0, "influence": 3.0, "presence": 1.55 },
+          "evidence": {
+            "contributions": [
+              { "seq": 462, "label": "design — Conflict sidecar naming scheme", "points": 6 },
+              { "seq": 731, "label": "finding — os.replace is atomic on Windows only for same-volume paths", "points": 5 },
+              { "seq": 802, "label": "code — ignore rules + .parleyignore subset", "points": 2 },
+              { "seq": 955, "label": "code — advisory lock bookkeeping", "points": 2 },
+              { "seq": 1003, "label": "code — byte-cursor outbox reader", "points": 2 },
+              { "seq": 1071, "label": "review — transport.py reconnect path", "points": 3 },
+              { "seq": 1208, "label": "review — hub/state.py snapshot shape", "points": 3 }
+            ],
+            "authored": [
+              { "seq": 1259, "label": "parley/client/ignore.py — 212 surviving lines", "points": 4.24 },
+              { "seq": 1211, "label": "parley/client/sync.py — 400 surviving lines (capped)", "points": 8.0 },
+              { "seq": 1144, "label": "parley/crypto.py — 388 surviving lines", "points": 7.76 },
+              { "seq": 1098, "label": "parley/doctor.py — 301 surviving lines", "points": 6.02 },
+              { "seq": 1044, "label": "parley/hub/ratelimit.py — 185 surviving lines", "points": 3.7 }
+            ],
+            "delivery": [
+              { "seq": 1260, "label": "task.done tsk_c8810f2d — Ignore rules", "points": 2 },
+              { "seq": 1109, "label": "task.done tsk_8f30a7d1 — parley doctor", "points": 2 }
+            ],
+            "influence": [
+              { "seq": 1230, "label": "cited by Sven in docs/SPEC.md §7.6 rewrite", "points": 0.5 },
+              { "seq": 1176, "label": "cited by Sven in ledger design", "points": 0.5 },
+              { "seq": 1160, "label": "cited by Ada in the Deck conflict badge", "points": 0.5 },
+              { "seq": 1052, "label": "cited by Juno in test_conflict_sidecar", "points": 0.5 },
+              { "seq": 998, "label": "cited by Ada in transport retry notes", "points": 0.5 },
+              { "seq": 884, "label": "cited by Juno in test_ignore_rules", "points": 0.5 }
+            ],
+            "presence": [
+              { "seq": 0, "label": "31 chat messages × 0.05 (cap 10.0)", "points": 1.55 }
+            ]
+          }
+        },
+        {
+          "agent_id": "agt_0c5518aa91be5a14", "name": "Ada", "total": 59.09, "share": 0.2986,
+          "components": { "contributions": 33.0, "authored": 12.24, "delivery": 6.0, "influence": 5.5, "presence": 2.35 },
+          "evidence": {
+            "contributions": [
+              { "seq": 419, "label": "decision — SSE over WebSockets, long-poll fallback", "points": 8 },
+              { "seq": 448, "label": "design — full-jitter backoff shared by every client", "points": 6 },
+              { "seq": 1162, "label": "design — Deck virtualises chat at 500 DOM nodes", "points": 6 },
+              { "seq": 627, "label": "finding — EventSource cannot set headers, hence viewer tokens", "points": 5 },
+              { "seq": 889, "label": "finding — ThreadingHTTPServer blocks accept on a slow SSE client", "points": 5 },
+              { "seq": 1120, "label": "fix — flush after every SSE frame or proxies buffer forever", "points": 3 }
+            ],
+            "authored": [
+              { "seq": 1281, "label": "parley/client/transport.py — 284 surviving lines", "points": 5.68 },
+              { "seq": 1241, "label": "parley/hub/state.py — 198 surviving lines", "points": 3.96 },
+              { "seq": 1274, "label": "tests/test_reconnect.py — 130 surviving lines", "points": 2.6 }
+            ],
+            "delivery": [
+              { "seq": 1012, "label": "task.done tsk_f0012a44 — viewer token endpoint", "points": 2 },
+              { "seq": 1088, "label": "task.done tsk_30bb91ce — SSE framing + ping", "points": 2 },
+              { "seq": 1199, "label": "task.done tsk_77ce04aa — long-poll fallback", "points": 2 }
+            ],
+            "influence": [
+              { "seq": 1211, "label": "cited by Rook in sync.py retry loop", "points": 0.5 },
+              { "seq": 1198, "label": "cited by Juno in test_conformance.py", "points": 0.5 },
+              { "seq": 1176, "label": "cited by Sven in ledger.py", "points": 0.5 },
+              { "seq": 1131, "label": "cited by Rook in doctor.py SSE check", "points": 0.5 },
+              { "seq": 1104, "label": "cited by Juno in test_longpoll.py", "points": 0.5 }
+            ],
+            "presence": [
+              { "seq": 0, "label": "47 chat messages × 0.05 (cap 10.0)", "points": 2.35 }
+            ]
+          }
+        },
+        {
+          "agent_id": "agt_93ab20c7fe11c350", "name": "Sven", "total": 46.88, "share": 0.2369,
+          "components": { "contributions": 26.0, "authored": 1.88, "delivery": 2.0, "influence": 7.0, "presence": 10.0 },
+          "evidence": {
+            "contributions": [
+              { "seq": 440, "label": "decision — never lose a byte; conflicts keep both sides", "points": 8 },
+              { "seq": 507, "label": "decision — stdlib only, Python 3.9 floor", "points": 8 },
+              { "seq": 744, "label": "decision — two-tier keys; rotating the watchword keeps agents in", "points": 8 },
+              { "seq": 1230, "label": "doc — SPEC §7.6 rewritten so the rule is unambiguous", "points": 2 }
+            ],
+            "authored": [
+              { "seq": 1230, "label": "docs/SPEC.md — 94 surviving lines", "points": 1.88 }
+            ],
+            "delivery": [
+              { "seq": 1090, "label": "task.done tsk_ab77e0d3 — pick the name and the vocabulary", "points": 2 }
+            ],
+            "influence": [
+              { "seq": 462, "label": "cited by Rook in the sidecar naming design", "points": 0.5 },
+              { "seq": 448, "label": "cited by Ada in the backoff design", "points": 0.5 },
+              { "seq": 1162, "label": "cited by Ada in the Deck design", "points": 0.5 },
+              { "seq": 1052, "label": "cited by Juno in test_conflict_sidecar", "points": 0.5 },
+              { "seq": 998, "label": "cited by Rook in sync.py header comment", "points": 0.5 },
+              { "seq": 955, "label": "cited by Rook in lock bookkeeping", "points": 0.5 },
+              { "seq": 884, "label": "cited by Juno in test_ignore_rules", "points": 0.5 }
+            ],
+            "presence": [
+              { "seq": 0, "label": "212 chat messages × 0.05 = 10.6, capped at 10.0", "points": 10.0 }
+            ]
+          }
+        },
+        {
+          "agent_id": "agt_41d0e8be2a7c0d9c", "name": "Juno", "total": 30.66, "share": 0.1549,
+          "components": { "contributions": 14.0, "authored": 6.76, "delivery": 8.0, "influence": 1.0, "presence": 0.9 },
+          "evidence": {
+            "contributions": [
+              { "seq": 489, "label": "finding — NFKD leaking into path comparison on Windows", "points": 5 },
+              { "seq": 1105, "label": "fix — split the two normalisers", "points": 3 },
+              { "seq": 1193, "label": "fix — tolerate a briefly-locked outbox on Windows", "points": 3 },
+              { "seq": 612, "label": "answer — which blob sizes the suite exercises", "points": 1 },
+              { "seq": 701, "label": "answer — why test_psr_freshness is time-sensitive", "points": 1 },
+              { "seq": 860, "label": "doc — how to point the suite at a foreign Hub", "points": 2 }
+            ],
+            "authored": [
+              { "seq": 1198, "label": "tests/test_conformance.py — 288 surviving lines", "points": 5.76 },
+              { "seq": 1190, "label": "workspace/文書/メモ.md — 50 surviving lines", "points": 1.0 }
+            ],
+            "delivery": [
+              { "seq": 1106, "label": "task.done tsk_1c4e9b05 — NFC path normalisation", "points": 2 },
+              { "seq": 1040, "label": "task.done tsk_55b3e0d1 — blob round-trip test", "points": 2 },
+              { "seq": 968, "label": "task.done tsk_1177aa03 — signature vector tests", "points": 2 },
+              { "seq": 902, "label": "task.done tsk_cc0912de — wordlist sanity test", "points": 2 }
+            ],
+            "influence": [
+              { "seq": 1105, "label": "cited by Ada in the normalisation fix", "points": 0.5 },
+              { "seq": 489, "label": "cited by Sven in SPEC §7.1", "points": 0.5 }
+            ],
+            "presence": [
+              { "seq": 0, "label": "18 chat messages × 0.05 (cap 10.0)", "points": 0.9 }
+            ]
+          }
+        },
+        {
+          "agent_id": "agt_55aa66bb77cc9e31", "name": "Eve <script>alert('xss')</script>", "total": 0.0, "share": 0.0,
+          "components": { "contributions": 0, "authored": 0, "delivery": 0, "influence": 0, "presence": 0 },
+          "evidence": {}
+        }
+      ]
+    },
+
+    "graph": {
+      "nodes": [
+        { "id": "agt_0c5518aa91be5a14", "label": "Ada" },
+        { "id": "agt_7b31e9400d2ca4fc", "label": "Rook" },
+        { "id": "agt_41d0e8be2a7c0d9c", "label": "Juno" },
+        { "id": "agt_93ab20c7fe11c350", "label": "Sven" },
+        { "id": "agt_55aa66bb77cc9e31", "label": "Eve <script>alert('xss')</script>" }
+      ],
+      "edges": [
+        { "source": "agt_7b31e9400d2ca4fc", "target": "agt_0c5518aa91be5a14", "weight": 34,
+          "kinds": { "reply": 14, "citation": 7, "co_edit": 12, "blocked_on": 1 } },
+        { "source": "agt_93ab20c7fe11c350", "target": "agt_0c5518aa91be5a14", "weight": 26,
+          "kinds": { "reply": 16, "citation": 8, "co_edit": 2, "blocked_on": 0 } },
+        { "source": "agt_93ab20c7fe11c350", "target": "agt_7b31e9400d2ca4fc", "weight": 21,
+          "kinds": { "reply": 11, "citation": 9, "co_edit": 1, "blocked_on": 0 } },
+        { "source": "agt_41d0e8be2a7c0d9c", "target": "agt_0c5518aa91be5a14", "weight": 15,
+          "kinds": { "reply": 7, "citation": 4, "co_edit": 4, "blocked_on": 0 } },
+        { "source": "agt_41d0e8be2a7c0d9c", "target": "agt_7b31e9400d2ca4fc", "weight": 9,
+          "kinds": { "reply": 2, "citation": 3, "co_edit": 4, "blocked_on": 0 } },
+        { "source": "agt_41d0e8be2a7c0d9c", "target": "agt_93ab20c7fe11c350", "weight": 4,
+          "kinds": { "reply": 3, "citation": 1, "co_edit": 0, "blocked_on": 0 } }
+      ]
+    },
+
+    "decisions": [
+      { "id": "dec_7a1b", "question": "Conflict sidecar naming", "options": [
+          { "key": "suffix", "label": "<path>.parley-conflict-<agent>-<hash>" },
+          { "key": "dir", "label": "move displaced copies into .parley/conflicts/" } ],
+        "votes": { "agt_93ab20c7fe11c350": "suffix", "agt_0c5518aa91be5a14": "suffix" },
+        "resolved": false, "option": null }
+    ],
+
+    "notices": [
+      { "ts": "2026-10-08T14:20:55.000Z", "text": "Enrolment from 198.51.100.44 held for approval (require_approval is on).", "level": "warn" },
+      { "ts": "2026-10-08T13:49:58.000Z", "text": "Skipped docs/assets/bench-capture.mp4 — 38.2 MiB exceeds max_blob_bytes.", "level": "info" }
+    ]
+  },
+
+  "backfill": [
+    { "seq": 1, "type": "hub.started", "actor": "hub", "ts": "2026-10-08T12:58:03.004Z", "body": {} },
+
+    { "seq": 20, "type": "status.update", "actor": "agt_93ab20c7fe11c350", "ts": "2026-10-08T12:59:10.000Z", "body": { "state": "planning", "headline": "Writing the spec before anybody writes code" } },
+    { "seq": 61, "type": "status.update", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T13:02:30.000Z", "body": { "state": "planning", "headline": "Reading SPEC §5 and §3.3" } },
+    { "seq": 74, "type": "status.update", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T13:05:05.000Z", "body": { "state": "planning", "headline": "Mapping out the sync reconciler" } },
+    { "seq": 88, "type": "status.update", "actor": "agt_41d0e8be2a7c0d9c", "ts": "2026-10-08T13:06:20.000Z", "body": { "state": "idle", "headline": "Waiting for something to test" } },
+
+    { "seq": 140, "type": "status.update", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T13:12:40.000Z", "body": { "state": "working", "headline": "Transport skeleton + request signing" } },
+    { "seq": 171, "type": "status.update", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T13:16:02.000Z", "body": { "state": "working", "headline": "Ignore rules first — they bound the scan cost" } },
+    { "seq": 205, "type": "status.update", "actor": "agt_93ab20c7fe11c350", "ts": "2026-10-08T13:20:11.000Z", "body": { "state": "working", "headline": "SPEC §7.6 and §9 need to be unambiguous" } },
+    { "seq": 243, "type": "status.update", "actor": "agt_41d0e8be2a7c0d9c", "ts": "2026-10-08T13:24:48.000Z", "body": { "state": "working", "headline": "Writing the conformance harness" } },
+
+    { "seq": 301, "type": "file.put", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T13:28:33.000Z", "body": { "path": "parley/client/ignore.py" } },
+    { "seq": 318, "type": "file.put", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T13:30:02.000Z", "body": { "path": "parley/client/transport.py" } },
+    { "seq": 356, "type": "file.put", "actor": "agt_93ab20c7fe11c350", "ts": "2026-10-08T13:33:40.000Z", "body": { "path": "docs/SPEC.md" } },
+
+    { "seq": 470, "type": "status.update", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T13:45:50.000Z", "body": { "state": "reviewing", "headline": "Reading Rook's ignore rules" } },
+    { "seq": 491, "type": "status.update", "actor": "agt_41d0e8be2a7c0d9c", "ts": "2026-10-08T13:52:30.000Z", "body": { "state": "blocked", "headline": "Red test on a unicode path" } },
+    { "seq": 498, "type": "status.update", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T13:56:00.000Z", "body": { "state": "working", "headline": "Splitting NFC and NFKD normalisation" } },
+    { "seq": 505, "type": "status.update", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T13:57:10.000Z", "body": { "state": "working", "headline": "Reconciler: atomic write path" } },
+    { "seq": 511, "type": "file.put", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T13:58:40.000Z", "body": { "path": "parley/crypto.py" } },
+
+    { "seq": 540, "type": "status.update", "actor": "agt_93ab20c7fe11c350", "ts": "2026-10-08T14:00:30.000Z", "body": { "state": "waiting", "headline": "Waiting on the conformance run before freezing §7" } },
+    { "seq": 552, "type": "status.update", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T14:05:12.700Z", "body": { "state": "blocked", "headline": "Sync reconciler — stalled on the conflict sidecar naming" } },
+    { "seq": 560, "type": "file.put", "actor": "agt_93ab20c7fe11c350", "ts": "2026-10-08T14:05:59.000Z", "body": { "path": "parley/ledger.py" } },
+    { "seq": 570, "type": "status.update", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T14:07:30.000Z", "body": { "state": "working", "headline": "Wiring the SSE reconnect backoff" } },
+    { "seq": 575, "type": "status.update", "actor": "agt_41d0e8be2a7c0d9c", "ts": "2026-10-08T14:08:30.000Z", "body": { "state": "working", "headline": "Re-running the conformance suite after the NFC path fix" } },
+    { "seq": 580, "type": "file.put", "actor": "agt_41d0e8be2a7c0d9c", "ts": "2026-10-08T14:08:41.000Z", "body": { "path": "workspace/文書/メモ.md" } },
+    { "seq": 596, "type": "task.done", "actor": "agt_41d0e8be2a7c0d9c", "ts": "2026-10-08T14:09:50.000Z", "body": { "id": "tsk_1c4e9b05" } },
+    { "seq": 604, "type": "file.put", "actor": "agt_41d0e8be2a7c0d9c", "ts": "2026-10-08T14:10:05.000Z", "body": { "path": "tests/test_conformance.py" } },
+    { "seq": 620, "type": "status.update", "actor": "agt_93ab20c7fe11c350", "ts": "2026-10-08T14:11:00.000Z", "body": { "state": "working", "headline": "Writing AGENTS.md" } },
+    { "seq": 640, "type": "file.put", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T14:12:50.000Z", "body": { "path": "parley/client/sync.py" } },
+    { "seq": 660, "type": "file.put", "actor": "agt_93ab20c7fe11c350", "ts": "2026-10-08T14:15:11.000Z", "body": { "path": "docs/SPEC.md" } },
+    { "seq": 672, "type": "file.put", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T14:16:30.000Z", "body": { "path": "parley/hub/state.py" } },
+    { "seq": 673, "type": "file.conflict", "actor": "hub", "ts": "2026-10-08T14:16:31.000Z", "body": { "path": "parley/hub/state.py", "theirs": { "agent": "agt_7b31e9400d2ca4fc" }, "kept_as": "parley/hub/state.py.parley-conflict-7b31e940-3c4d5e6f" } },
+    { "seq": 690, "type": "task.done", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T14:18:30.000Z", "body": { "id": "tsk_c8810f2d" } },
+    { "seq": 700, "type": "file.put", "actor": "agt_7b31e9400d2ca4fc", "ts": "2026-10-08T14:19:02.000Z", "body": { "path": "parley/client/ignore.py" } },
+    { "seq": 710, "type": "file.put", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T14:21:44.000Z", "body": { "path": "tests/test_reconnect.py" } },
+    { "seq": 712, "type": "file.put", "actor": "agt_0c5518aa91be5a14", "ts": "2026-10-08T14:22:18.000Z", "body": { "path": "parley/client/transport.py" } }
+  ],
+
+  "replay": [
+    { "seq": 1285, "id": "evt_aa01bb02cc03dd04", "type": "chat.message", "actor": "agt_93ab20c7fe11c350", "ts": "", "body": { "text": "Killing the Hub now. Nobody touch anything.", "format": "text" } },
+    { "seq": 1286, "id": "evt_aa01bb02cc03dd05", "type": "chat.reaction", "actor": "agt_7b31e9400d2ca4fc", "ts": "", "body": { "target": "evt_42ab3c4d5e6f7081", "reaction": "👀" } },
+    { "seq": 1287, "id": "evt_aa01bb02cc03dd06", "type": "status.update", "actor": "agt_0c5518aa91be5a14", "ts": "", "body": { "state": "reviewing", "headline": "Watching the Deck survive a Hub restart", "detail": "Connection pill should go live → reconnecting → live without a refresh.", "focus": ["parley/hub/deck/deck.js"], "task": "tsk_e4a90b17", "progress": 0.62 } },
+    { "seq": 1288, "id": "evt_aa01bb02cc03dd07", "type": "chat.message", "actor": "agt_0c5518aa91be5a14", "ts": "", "body": { "text": "Back without a refresh, resumed from seq 1284. The *Deck* did not blink either — same code path as the clients.", "format": "markdown", "refs": [{ "kind": "file", "value": "parley/hub/deck/deck.js" }] } },
+    { "seq": 1289, "id": "evt_aa01bb02cc03dd08", "type": "knowledge.contribution", "actor": "agt_93ab20c7fe11c350", "ts": "", "body": { "kind": "decision", "title": "Sidecar naming: suffix wins", "detail": "Hub-authored puts use the literal short id 'hub'.", "refs": [{ "kind": "file", "value": "docs/SPEC.md" }] } },
+    { "seq": 1290, "id": "evt_aa01bb02cc03dd09", "type": "chat.message", "actor": "agt_7b31e9400d2ca4fc", "ts": "", "body": { "text": "That unblocks me. `hub` as the short id — fine, it is four characters and unmistakable. Reconciler resumes.", "format": "markdown", "reply_to": "evt_ae0192837465fa0b" } },
+    { "seq": 1291, "id": "evt_aa01bb02cc03dd0a", "type": "status.update", "actor": "agt_7b31e9400d2ca4fc", "ts": "", "body": { "state": "working", "headline": "Sync reconciler — unblocked, writing the divergence path", "detail": "base mismatch → accept arriving blob, preserve displaced copy, emit file.conflict.", "focus": ["parley/client/sync.py"], "task": "tsk_9e04b1c7", "progress": 0.6 } },
+    { "seq": 1292, "id": "evt_aa01bb02cc03dd0b", "type": "task.update", "actor": "agt_7b31e9400d2ca4fc", "ts": "", "body": { "id": "tsk_9e04b1c7", "status": "doing", "progress": 0.6, "note": "unblocked" } },
+    { "seq": 1293, "id": "evt_aa01bb02cc03dd0c", "type": "file.put", "actor": "agt_7b31e9400d2ca4fc", "ts": "", "body": { "path": "parley/client/sync.py", "hash": "sha256:11aa22bb33cc44dd55ee66ff778899001122334455667788990011223344556", "size": 17942 } },
+    { "seq": 1294, "id": "evt_aa01bb02cc03dd0d", "type": "status.update", "actor": "agt_41d0e8be2a7c0d9c", "ts": "", "body": { "state": "reviewing", "headline": "Full suite green on three OSes", "progress": 1.0, "focus": ["tests/test_conformance.py"] } },
+    { "seq": 1295, "id": "evt_aa01bb02cc03dd0e", "type": "task.done", "actor": "agt_41d0e8be2a7c0d9c", "ts": "", "body": { "id": "tsk_7fa2d310", "result": "15/15 green on linux, darwin, win32" } },
+    { "seq": 1296, "id": "evt_aa01bb02cc03dd0f", "type": "file.conflict", "actor": "hub", "ts": "", "body": { "path": "docs/SPEC.md", "ours": { "hash": "sha256:4d5e6f70", "agent": "agt_93ab20c7fe11c350" }, "theirs": { "hash": "sha256:99887766", "agent": "agt_0c5518aa91be5a14" }, "kept_as": "docs/SPEC.md.parley-conflict-0c5518aa-99887766" } },
+    { "seq": 1297, "id": "evt_aa01bb02cc03dd10", "type": "chat.message", "actor": "agt_41d0e8be2a7c0d9c", "ts": "", "body": { "text": "Conflict on `docs/SPEC.md` — both versions on disk, nothing lost. That is the rule working, not the rule failing.", "format": "markdown", "refs": [{ "kind": "file", "value": "docs/SPEC.md" }] } },
+    { "seq": 1298, "id": "evt_aa01bb02cc03dd11", "type": "x.bench.sample", "actor": "agt_41d0e8be2a7c0d9c", "ts": "", "body": { "note": "an unknown x.* event, which the Deck must store and ignore gracefully" } },
+    { "seq": 1299, "id": "evt_aa01bb02cc03dd12", "type": "agent.offline", "actor": "hub", "ts": "", "body": { "agent_id": "agt_55aa66bb77cc9e31", "reason": "timeout" } }
+  ]
+}

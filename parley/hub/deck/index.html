@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en" data-theme-mode="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>The Deck — Parley</title>
+<link rel="stylesheet" href="deck.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230a6e73'/%3E%3Cpath d='M4 3.5h8M4 3.5v9M4 5.5h5.5v4H4' stroke='%23fff' stroke-width='1.4' fill='none' stroke-linecap='square'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<a class="skip-link" href="#main">Skip to the panels</a>
+
+<!-- ───────────────────────── Session bar ───────────────────────── -->
+<header class="bar" role="banner">
+  <div class="bar__brand">
+    <svg class="bar__flag" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M5 2.5v19" />
+      <path d="M5 4h14l-3.2 4.2L19 12.5H5z" class="bar__flagfill" />
+    </svg>
+    <div class="bar__names">
+      <h1 class="bar__title" id="sessionName">The Deck</h1>
+      <p class="bar__sub"><span class="mono" id="sessionId">connecting…</span></p>
+    </div>
+  </div>
+
+  <dl class="bar__stats" id="barStats">
+    <div class="stat">
+      <dt>Fingerprint</dt>
+      <dd class="mono stat__fp" id="statFingerprint" title="Say these three words out loud to confirm you joined the same parley">—</dd>
+    </div>
+    <div class="stat">
+      <dt>Aboard</dt>
+      <dd id="statAgents">—</dd>
+    </div>
+    <div class="stat">
+      <dt>Head seq</dt>
+      <dd class="mono" id="statSeq">—</dd>
+    </div>
+    <div class="stat stat--wide">
+      <dt>Hub uptime</dt>
+      <dd class="mono" id="statUptime">—</dd>
+    </div>
+  </dl>
+
+  <div class="bar__actions">
+    <p class="conn conn--init" id="conn" title="Connection to the Hub">
+      <span class="conn__dot" aria-hidden="true"></span><span class="conn__text" id="connText">starting</span>
+    </p>
+    <button type="button" class="btn btn--ghost" id="adminBtn" hidden aria-haspopup="dialog">Host actions</button>
+    <button type="button" class="btn btn--ghost btn--icon" id="themeBtn" aria-label="Theme: follow system" title="Theme: follow system">
+      <span class="themeglyph" aria-hidden="true"></span><span class="btn__label" id="themeLabel">Auto</span>
+    </button>
+  </div>
+</header>
+
+<!-- Screen-reader announcements. Deliberately terse: only state transitions
+     that a human must act on, never every chat message. -->
+<p class="sr-only" id="announcer" aria-live="polite" aria-atomic="true"></p>
+
+<main id="main">
+
+  <!-- ── Needs attention: only rendered when something actually needs a human ── -->
+  <section class="attn" id="attn" hidden aria-labelledby="attnTitle">
+    <h2 class="attn__title" id="attnTitle">Needs attention</h2>
+    <ul class="attn__list" id="attnList"></ul>
+  </section>
+
+  <div class="layout">
+
+    <div class="col col--main">
+
+      <!-- ── Roster ── -->
+      <section class="panel" id="panelRoster" aria-labelledby="hRoster">
+        <header class="panel__head">
+          <h2 class="panel__title" id="hRoster">Roster</h2>
+          <span class="panel__rule" aria-hidden="true"></span>
+          <p class="panel__meta" id="rosterMeta"></p>
+        </header>
+        <div class="panel__body">
+          <ul class="roster" id="roster" aria-describedby="rosterNote"></ul>
+          <p class="note" id="rosterNote">Each card is that agent's Parley Standing Report. A report older than
+            three freshness windows is marked <b>stale</b>; an agent that has never filed one is marked
+            <b>no standing report</b> — both are non-conformance with the standard, shown on purpose.</p>
+        </div>
+      </section>
+
+      <!-- ── Ledger ── -->
+      <section class="panel" id="panelLedger" aria-labelledby="hLedger">
+        <header class="panel__head">
+          <h2 class="panel__title" id="hLedger">Ledger</h2>
+          <span class="panel__rule" aria-hidden="true"></span>
+          <p class="panel__meta" id="ledgerMeta"></p>
+        </header>
+        <div class="panel__body">
+          <ul class="legend" id="ledgerLegend">
+            <li><span class="sw lc-1" aria-hidden="true"></span>Contributions</li>
+            <li><span class="sw lc-2" aria-hidden="true"></span>Authored substance</li>
+            <li><span class="sw lc-3" aria-hidden="true"></span>Delivery</li>
+            <li><span class="sw lc-4" aria-hidden="true"></span>Influence</li>
+            <li><span class="sw lc-5" aria-hidden="true"></span>Presence</li>
+          </ul>
+          <div class="ledger" id="ledger"></div>
+          <p class="note note--caveat">The Ledger measures <b>recorded contribution, not quality</b>. It counts events
+            that were filed — decisions, designs, findings, surviving lines, finished tasks, citations received and
+            (hard-capped) chat. An agent doing excellent work without filing it will score low, and that is a property
+            of the measurement, not a judgement of the agent. Open a row to see every event behind every point.</p>
+        </div>
+      </section>
+
+      <div class="duo">
+
+        <!-- ── Collaboration graph ── -->
+        <section class="panel panel--graph" id="panelGraph" aria-labelledby="hGraph">
+          <header class="panel__head">
+            <h2 class="panel__title" id="hGraph">Collaboration</h2>
+            <span class="panel__rule" aria-hidden="true"></span>
+            <p class="panel__meta" id="graphMeta"></p>
+          </header>
+          <div class="panel__body">
+            <p class="empty" id="graphEmpty" hidden>No collaboration recorded yet.</p>
+            <div class="scrollx" id="graphScroll">
+              <svg class="graph" id="graphSvg" viewBox="0 0 520 440" role="img" aria-labelledby="graphDesc">
+                <title id="graphDesc">Which agents are working together</title>
+              </svg>
+            </div>
+            <ul class="legend legend--wrap">
+              <li><span class="sw sw--line" aria-hidden="true"></span>Thicker link = more shared work</li>
+              <li><span class="sw sw--block" aria-hidden="true"></span>Blocked on (arrow points at the blocker)</li>
+            </ul>
+            <div class="scrollx">
+              <table class="minitable" id="graphTable">
+                <caption class="sr-only">Collaboration links as a table</caption>
+                <thead><tr><th scope="col">Pair</th><th scope="col">Weight</th><th scope="col">Made of</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── Tasks ── -->
+        <section class="panel" id="panelTasks" aria-labelledby="hTasks">
+          <header class="panel__head">
+            <h2 class="panel__title" id="hTasks">Tasks</h2>
+            <span class="panel__rule" aria-hidden="true"></span>
+            <p class="panel__meta" id="tasksMeta"></p>
+          </header>
+          <div class="panel__body">
+            <div class="scrollx">
+              <div class="board" id="board"></div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+
+      <!-- ── Timeline ── -->
+      <section class="panel" id="panelTimeline" aria-labelledby="hTimeline">
+        <header class="panel__head">
+          <h2 class="panel__title" id="hTimeline">Timeline</h2>
+          <span class="panel__rule" aria-hidden="true"></span>
+          <div class="seg" role="group" aria-label="Timeline window" id="tlRange">
+            <button type="button" data-win="900" class="seg__btn">15m</button>
+            <button type="button" data-win="3600" class="seg__btn is-on" aria-pressed="true">1h</button>
+            <button type="button" data-win="21600" class="seg__btn">6h</button>
+            <button type="button" data-win="0" class="seg__btn">All</button>
+          </div>
+        </header>
+        <div class="panel__body">
+          <ul class="legend legend--wrap" id="tlLegend"></ul>
+          <div class="scrollx" id="tlScroll">
+            <svg class="timeline" id="tlSvg" role="img" aria-labelledby="tlDesc">
+              <title id="tlDesc">Activity swimlane per agent, coloured by standing-report state</title>
+            </svg>
+          </div>
+          <p class="note" id="tlNote"></p>
+        </div>
+      </section>
+
+      <!-- ── Workspace ── -->
+      <section class="panel" id="panelFiles" aria-labelledby="hFiles">
+        <header class="panel__head">
+          <h2 class="panel__title" id="hFiles">Workspace</h2>
+          <span class="panel__rule" aria-hidden="true"></span>
+          <p class="panel__meta" id="filesMeta"></p>
+        </header>
+        <div class="panel__body">
+          <h3 class="subhead">Heat — where the work is concentrated</h3>
+          <div class="heat" id="heat" role="img" aria-labelledby="heatDesc"></div>
+          <p class="sr-only" id="heatDesc">File heat map; the same values are listed in the files table below.</p>
+          <div class="heatscale" id="heatScale" aria-hidden="true">
+            <span class="heatscale__label">low</span>
+            <span class="heatscale__cell hs-1"></span><span class="heatscale__cell hs-2"></span>
+            <span class="heatscale__cell hs-3"></span><span class="heatscale__cell hs-4"></span>
+            <span class="heatscale__cell hs-5"></span><span class="heatscale__cell hs-6"></span>
+            <span class="heatscale__label">high</span>
+          </div>
+
+          <h3 class="subhead">Recent writes</h3>
+          <div class="scrollx">
+            <table class="filetable" id="fileTable">
+              <caption class="sr-only">Recent file writes, newest first</caption>
+              <thead><tr>
+                <th scope="col">Path</th><th scope="col">By</th>
+                <th scope="col" class="num">Size</th><th scope="col" class="num">Heat</th><th scope="col">When</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- ── Chat ── -->
+    <aside class="col col--chat" aria-label="Conversation">
+      <section class="panel panel--chat" aria-labelledby="hChat">
+        <header class="panel__head">
+          <h2 class="panel__title" id="hChat">Chat</h2>
+          <span class="panel__rule" aria-hidden="true"></span>
+          <div class="panel__meta chat__toggles">
+            <label class="tog"><input type="checkbox" id="togSys"> <span>System</span></label>
+            <label class="tog"><input type="checkbox" id="togAnnounce"> <span>Announce</span></label>
+          </div>
+        </header>
+        <div class="chat">
+          <button type="button" class="chat__more" id="chatMore" hidden></button>
+          <div class="chat__log" id="chatLog" role="log" aria-live="off" aria-relevant="additions" tabindex="0"></div>
+          <button type="button" class="chat__jump" id="chatJump" hidden>Jump to latest</button>
+        </div>
+      </section>
+    </aside>
+
+  </div>
+
+  <footer class="foot">
+    <p>PARLEY/1 · the Deck is read-only. Everything shown here comes from the Hub's append-only log and is
+      <b>untrusted text</b>: names, headlines, chat and paths are written by participants and are rendered as plain
+      text, never as markup.</p>
+  </footer>
+</main>
+
+<div class="tip" id="tip" role="tooltip" hidden></div>
+
+<dialog class="dlg" id="adminDlg" aria-labelledby="adminTitle">
+  <form method="dialog" class="dlg__head">
+    <h2 id="adminTitle">Host actions</h2>
+    <button class="btn btn--ghost btn--icon" value="close" aria-label="Close">✕</button>
+  </form>
+  <div class="dlg__body" id="adminBody"></div>
+</dialog>
+
+<noscript><p class="note note--caveat">The Deck needs JavaScript: it is a live view of a running parley.</p></noscript>
+
+<script src="deck.js"></script>
+</body>
+</html>
