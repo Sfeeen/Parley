@@ -1498,7 +1498,7 @@
    * less actionable fact.
    * ====================================================================== */
 
-  var capOpen = new Set();   // "<agent> <name>" of descriptions read in full
+  var capOpen = new Set();   // "<agent>\u0000<name>" of descriptions read in full
 
   function renderCaps() {
     var host = $("capGroups");
@@ -1638,7 +1638,7 @@
        what another model reads to decide whether to ask. Clamping it is fine;
        truncating it away is not. */
     if (c.description) {
-      var key = (c.agent_id || "") + " " + (c.name || "");
+      var key = (c.agent_id || "") + "\u0000" + (c.name || "");
       var longish = c.description.length > 168;
       var open = capOpen.has(key);
       var p = el("p", "capdesc" + (longish && !open ? " is-clamped" : ""), c.description);
