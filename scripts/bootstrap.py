@@ -168,7 +168,7 @@ def check_repo(root):
         print("")
         print("    Expected a full clone at: " + root)
         print("    Re-clone it:")
-        print("      git clone https://github.com/<org>/parley.git")
+        print("      git clone https://github.com/Sfeeen/Parley.git")
         return False
     ok("clone looks intact: " + root)
 

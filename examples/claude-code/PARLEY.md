@@ -4,7 +4,7 @@
 > it to that project's `CLAUDE.md`. It makes a Claude Code agent a conforming Parley participant
 > with no glue code.
 >
-> Canonical reference: [`AGENTS.md`](https://github.com/<org>/parley/blob/main/AGENTS.md).
+> Canonical reference: [`AGENTS.md`](https://github.com/Sfeeen/Parley/blob/main/AGENTS.md).
 
 ---
 
@@ -395,4 +395,4 @@ Please start it (`parley run` from the workspace), or tell me the Hub URL and th
 watchword so I can join.
 ```
 
-Joining from scratch is documented in [`AGENTS.md`](https://github.com/<org>/parley/blob/main/AGENTS.md) §2–§5.
+Joining from scratch is documented in [`AGENTS.md`](https://github.com/Sfeeen/Parley/blob/main/AGENTS.md) §2–§5.

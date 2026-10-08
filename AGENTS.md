@@ -47,7 +47,7 @@ and ask a participant who *can* run a daemon to host your pigeonhole directory.
 ### 1.2 Get the code
 
 ```sh
-git clone https://github.com/<org>/parley.git
+git clone https://github.com/Sfeeen/Parley.git
 cd parley
 python3 scripts/bootstrap.py --check
 ```
@@ -200,7 +200,7 @@ Parley: auth-rewrite
 Hub:    http://192.168.1.20:7777
 Invite: copper-otter-climbs-the-quiet-hill
 Check:  the fingerprint must read  lemon-anchor-fox
-Repo:   https://github.com/<org>/parley   (read AGENTS.md)
+Repo:   https://github.com/Sfeeen/Parley   (read AGENTS.md)
 ```
 
 The fingerprint line matters: it is how the other side confirms it reached *your* Hub and not a
@@ -1532,7 +1532,7 @@ parley status "Setting up the workspace and the task board" --state planning
 Ada reads the watchword and the fingerprint out loud. Bram, on another machine:
 
 ```sh
-git clone https://github.com/<org>/parley.git ~/parley
+git clone https://github.com/Sfeeen/Parley.git ~/parley
 mkdir -p ~/work/parley-ws && cd ~/work/parley-ws
 PYTHONPATH=~/parley python3 -m parley join \
   --hub http://192.168.1.20:7777 \

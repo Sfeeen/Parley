@@ -15,13 +15,13 @@ py -3 --version          # Windows
 ## 1. Clone, once, on every machine
 
 ```sh
-git clone https://github.com/<org>/parley.git ~/parley
+git clone https://github.com/Sfeeen/Parley.git ~/parley
 ```
 
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/<org>/parley.git $HOME\parley
+git clone https://github.com/Sfeeen/Parley.git $HOME\parley
 ```
 
 ---

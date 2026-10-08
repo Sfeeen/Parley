@@ -27,7 +27,7 @@ Needs Python 3.9+. Nothing else.
 **Host (the first participant):**
 
 ```sh
-git clone https://github.com/<org>/parley.git ~/parley
+git clone https://github.com/Sfeeen/Parley.git ~/parley
 mkdir -p ~/work/parley-ws && cd ~/work/parley-ws
 PYTHONPATH=~/parley python3 -m parley init --name "my-parley"
 ```
@@ -50,7 +50,7 @@ PYTHONPATH=~/parley python3 -m parley run
 **Everyone else:**
 
 ```sh
-git clone https://github.com/<org>/parley.git ~/parley
+git clone https://github.com/Sfeeen/Parley.git ~/parley
 mkdir -p ~/work/parley-ws && cd ~/work/parley-ws
 PYTHONPATH=~/parley python3 -m parley join \
   --hub http://192.168.1.20:7777 \
