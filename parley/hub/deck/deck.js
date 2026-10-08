@@ -37,6 +37,22 @@
     ["presence", "Presence", "chat messages, hard-capped so chattiness cannot win"]
   ];
 
+  /* ---- the Exchange (SPEC §15) ---- */
+  var REQ_STATES = ["pending", "accepted", "done", "failed", "declined", "expired", "cancelled"];
+  var REQ_TERMINAL = ["done", "failed", "declined", "expired", "cancelled"];
+  /* The Deck does not police `kind` or `safety` — it renders what the provider
+     announced. An unknown value is shown as itself, because silently rewriting
+     a bad `safety` is exactly the mistake SPEC §15.1 calls the worst thing an
+     agent can do in the Exchange. */
+  var SAFETY_LABEL = {
+    safe: "safe",
+    guarded: "guarded · needs consent",
+    dangerous: "dangerous · human approval per call"
+  };
+  var DEFAULT_TIMEOUT_S = 300;
+  var REQ_HISTORY_PAGE = 6;    // settled rows shown before "show all"
+  var MAX_LOCAL_TERMINAL = 200; // terminal records the browser keeps between snapshots
+
   /* ======================================================== 0. boot params */
 
   var qs = new URLSearchParams(location.search);
@@ -310,11 +326,19 @@
     files: { count: 0, bytes: 0, recent: [], conflicts: [], heat: {} },
     ledger: null, graph: null, notices: [],
     tl: { lanes: new Map(), marks: [], t0: NaN },
-    connected: false
+    connected: false,
+
+    /* The Exchange. `capsKey` / `reqsKey` record whether the Hub sent the key at
+       all, which is a different fact from "the key was empty" and gets a
+       different, quieter empty state. A Hub that predates §15 must not look
+       like a parley where nobody ever offered anything. */
+    caps: [], capsKey: false,
+    reqs: new Map(), reqsKey: false, reqCounts: null, consentRaw: []
   };
 
   var dirty = {};
   var rafPending = false;
+  var reqProgressDirty = new Set();   // request ids whose progress moved since the last frame
   function mark(what) { dirty[what] = true; schedule(); }
   function schedule() {
     if (rafPending) return;
@@ -327,6 +351,13 @@
     try {
       if (d.bar) renderBar();
       if (d.roster) { renderRoster(); renderAttention(); }
+      if (d.caps) renderCaps();
+      /* A burst of request.progress is the one event storm this panel can see
+         (SPEC §8.4): a provider streaming progress on four requests at once.
+         Structural changes rebuild the list; progress only writes into the
+         handful of nodes it actually moved. Both still cost one frame. */
+      if (d.reqs) { renderRequests(); renderAttention(); }
+      else if (d.reqProgress) paintReqProgress();
       if (d.ledger) renderLedger();
       if (d.graph) renderGraph();
       if (d.tasks) renderTasks();
@@ -452,9 +483,146 @@
     S.notices = snap.notices || [];
     S.locks = snap.locks || [];
 
+    ingestCapabilities(snap.capabilities);
+    ingestRequests(snap.requests);
+
     if (addedChat) chatReset();
     mark("bar"); mark("roster"); mark("ledger"); mark("graph");
     mark("tasks"); mark("files"); mark("timeline"); mark("chat");
+    mark("caps"); mark("reqs");
+  }
+
+  /* ---------------------------------------------------- the Exchange ingest
+   * Both keys are brand new (INTERNAL-API "StateView snapshot additions") and a
+   * Hub that has not shipped them yet must degrade quietly, so every field is
+   * read defensively and nothing here can throw into the snapshot path.
+   * ====================================================================== */
+
+  function num(v, dflt) { return (typeof v === "number" && isFinite(v)) ? v : (dflt || 0); }
+  function str(v) { return v === undefined || v === null ? "" : String(v); }
+
+  function ingestCapabilities(raw) {
+    var rows = null;
+    if (raw && typeof raw === "object" && Array.isArray(raw.capabilities)) rows = raw.capabilities;
+    else if (Array.isArray(raw)) rows = raw;            // tolerate a bare list
+    if (!rows) return;                                   // key absent: keep what we have
+    S.capsKey = true;
+    S.caps = rows.filter(function (c) { return c && typeof c === "object"; }).map(capRec);
+  }
+
+  function capRec(c) {
+    return {
+      name: str(c.name),
+      title: str(c.title),
+      kind: str(c.kind) || "tool",
+      description: str(c.description),
+      input_schema: (c.input_schema && typeof c.input_schema === "object") ? c.input_schema : null,
+      output: str(c.output) || "text",
+      safety: str(c.safety) || "guarded",
+      cost: str(c.cost),
+      concurrency: Math.max(0, Math.round(num(c.concurrency, 1))),
+      exclusive: c.exclusive === true,
+      avg_duration_s: num(c.avg_duration_s),
+      agent_id: str(c.agent_id),
+      agent_name: str(c.agent_name),
+      online: c.online !== false,
+      in_flight: Math.max(0, Math.round(num(c.in_flight)))
+    };
+  }
+
+  function ingestRequests(raw) {
+    if (!raw || typeof raw !== "object") return;
+    S.reqsKey = true;
+    var seen = Object.create(null);
+    [raw.in_flight, raw.recent].forEach(function (list) {
+      if (!Array.isArray(list)) return;
+      list.forEach(function (r) {
+        var rec = reqRec(r);
+        if (!rec) return;
+        seen[rec.id] = true;
+        S.reqs.set(rec.id, rec);
+      });
+    });
+    /* Records the Deck applied from the live stream but the snapshot has not
+       caught up to are kept; the next snapshot supersedes them. Terminal ones
+       are capped so a long session cannot grow without bound. */
+    trimRequests();
+    S.reqCounts = (raw.counts && typeof raw.counts === "object") ? raw.counts : null;
+    S.consentRaw = Array.isArray(raw.pending_consent) ? raw.pending_consent : [];
+  }
+
+  function reqRec(r) {
+    if (!r || typeof r !== "object") return null;
+    var id = str(r.id);
+    if (!id) return null;
+    var state = str(r.state) || "pending";
+    if (REQ_STATES.indexOf(state) < 0) state = "pending";
+    var err = (r.error && typeof r.error === "object") ? r.error : null;
+    return {
+      id: id,
+      from: str(r.from),
+      to: str(r.to) || "any",
+      capability: str(r.capability),
+      instruction: str(r.instruction),
+      reason: str(r.reason),
+      state: state,
+      created_at: str(r.created_at),
+      created_ts: num(r.created_ts),
+      accepted_by: str(r.accepted_by),
+      accepted_at: str(r.accepted_at),
+      eta_s: num(r.eta_s),
+      timeout_s: num(r.timeout_s, DEFAULT_TIMEOUT_S) || DEFAULT_TIMEOUT_S,
+      priority: Math.max(1, Math.min(5, Math.round(num(r.priority, 3)))),
+      progress: (typeof r.progress === "number" && isFinite(r.progress))
+        ? Math.max(0, Math.min(1, r.progress)) : null,
+      note: str(r.note),
+      output_text: str(r.output_text),
+      files: Array.isArray(r.files) ? r.files.filter(function (f) { return typeof f === "string"; }) : [],
+      error: err ? { code: str(err.code), message: str(err.message), hint: str(err.hint) } : null,
+      duration_s: num(r.duration_s),
+      decline_code: str(r.decline_code),
+      decline_reason: str(r.decline_reason),
+      terminal_at: str(r.terminal_at),
+      terminal_ts: num(r.terminal_ts),
+      abandoned: r.abandoned === true,
+      late_result: r.late_result === true,
+      anomalies: Array.isArray(r.anomalies) ? r.anomalies.map(str) : [],
+      /* Two shapes the Hub may use to say "this one is waiting on the operator".
+         Neither is load-bearing: `requests.pending_consent` is the documented
+         carrier and this is belt-and-braces. */
+      needs_consent: r.needs_consent === true ||
+        r.consent === "ask" ||
+        !!(r.consent && typeof r.consent === "object" && r.consent.action === "ask"),
+      safety: str(r.safety) || (r.consent && typeof r.consent === "object" ? str(r.consent.safety) : ""),
+      why: str(r.why) || (r.consent && typeof r.consent === "object" ? str(r.consent.why) : "")
+    };
+  }
+
+  function trimRequests() {
+    var terminal = [];
+    S.reqs.forEach(function (r) {
+      if (REQ_TERMINAL.indexOf(r.state) >= 0) terminal.push(r);
+    });
+    if (terminal.length <= MAX_LOCAL_TERMINAL) return;
+    terminal.sort(function (a, b) { return reqEndMs(a) - reqEndMs(b); });
+    terminal.slice(0, terminal.length - MAX_LOCAL_TERMINAL).forEach(function (r) {
+      S.reqs.delete(r.id);
+    });
+  }
+
+  function reqStartMs(r) {
+    var t = parseTs(r.created_at);
+    if (isFinite(t)) return t;
+    return r.created_ts > 0 ? r.created_ts * 1000 : NaN;
+  }
+  function reqEndMs(r) {
+    var t = parseTs(r.terminal_at);
+    if (isFinite(t)) return t;
+    return r.terminal_ts > 0 ? r.terminal_ts * 1000 : NaN;
+  }
+  function reqDeadlineMs(r) {
+    var s = reqStartMs(r);
+    return isFinite(s) ? s + r.timeout_s * 1000 : NaN;
   }
 
   function seedLane(rec) {
@@ -685,6 +853,160 @@
         S.notices.unshift({ ts: ev.ts, text: String(b.text || ""), level: b.level || "info" });
         sysLine(ev, t, [["notice", "b"], [" " + String(b.text || ""), ""]]);
         break;
+
+      /* ---- the Exchange (SPEC §15) ----------------------------------------
+         `capability.announce` is total, not incremental: it replaces that
+         agent's whole catalogue. Applying it any other way would leave a
+         revoked capability on the Deck forever. */
+      case "capability.announce": {
+        var announced = Array.isArray(b.capabilities) ? b.capabilities : [];
+        S.capsKey = true;
+        S.caps = S.caps.filter(function (c) { return c.agent_id !== actor; });
+        announced.forEach(function (c) {
+          if (!c || typeof c !== "object") return;
+          var rec = capRec(c);
+          if (!rec.agent_id) rec.agent_id = actor;
+          if (!rec.agent_name) rec.agent_name = agentName(actor);
+          rec.online = true;
+          S.caps.push(rec);
+        });
+        sysLine(ev, t, [[agentName(actor), "b"],
+          [" announced " + announced.length + (announced.length === 1 ? " capability" : " capabilities"), ""]]);
+        mark("caps"); scheduleStateRefresh();
+        break;
+      }
+
+      case "capability.revoke": {
+        var gone = Array.isArray(b.names) ? b.names.map(str) : [];
+        S.caps = S.caps.filter(function (c) {
+          return !(c.agent_id === actor && gone.indexOf(c.name) >= 0);
+        });
+        sysLine(ev, t, [[agentName(actor), "b"], [" withdrew ", ""], [gone.join(", "), "mono"]]);
+        mark("caps"); scheduleStateRefresh();
+        break;
+      }
+
+      case "request.create": {
+        var rid = str(b.id);
+        if (rid && !S.reqs.has(rid)) {
+          S.reqsKey = true;
+          var fresh = reqRec({
+            id: rid, from: actor, to: b.to, capability: b.capability,
+            instruction: b.instruction, reason: b.reason, state: "pending",
+            created_at: ev.ts, timeout_s: b.timeout_s, priority: b.priority
+          });
+          if (fresh) S.reqs.set(rid, fresh);
+        }
+        sysLine(ev, t, [[agentName(actor), "b"],
+          [" asked " + (str(b.to) === "any" || !b.to ? "anyone" : agentName(b.to)) + " for ", ""],
+          [str(b.capability) || "a free-form task", "mono"]]);
+        mark("reqs"); scheduleStateRefresh();
+        break;
+      }
+
+      case "request.accept": {
+        var ra = S.reqs.get(str(b.id));
+        if (ra && ra.state === "pending") {
+          ra.state = "accepted"; ra.accepted_by = actor; ra.accepted_at = ev.ts;
+          ra.eta_s = num(b.eta_s); ra.needs_consent = false;
+        }
+        sysLine(ev, t, [[agentName(actor), "b"], [" accepted ", ""], [str(b.id), "mono"]]);
+        mark("reqs"); scheduleStateRefresh();
+        break;
+      }
+
+      /* The chatty one. No system line, no state refresh, no full re-render —
+         just the record and a targeted repaint of the nodes that moved. */
+      case "request.progress": {
+        var rp = S.reqs.get(str(b.id));
+        if (rp) {
+          if (typeof b.progress === "number" && isFinite(b.progress)) {
+            rp.progress = Math.max(0, Math.min(1, b.progress));
+          }
+          if (typeof b.note === "string") rp.note = b.note;
+          reqProgressDirty.add(rp.id);
+          mark("reqProgress");
+        }
+        break;
+      }
+
+      case "request.result": {
+        var rr = S.reqs.get(str(b.id));
+        var rok = b.ok !== false;
+        if (rr && REQ_TERMINAL.indexOf(rr.state) < 0) {
+          rr.state = rok ? "done" : "failed";
+          if (!rr.accepted_by) rr.accepted_by = actor;
+          rr.output_text = str(b.output_text);
+          rr.files = Array.isArray(b.files)
+            ? b.files.filter(function (f) { return typeof f === "string"; }) : [];
+          rr.error = (b.error && typeof b.error === "object")
+            ? { code: str(b.error.code), message: str(b.error.message), hint: str(b.error.hint) } : null;
+          rr.duration_s = num(b.duration_s);
+          rr.terminal_at = ev.ts;
+          if (rok) rr.progress = 1;
+          rr.needs_consent = false;
+        }
+        sysLine(ev, t, [[agentName(actor), "b"],
+          [(rok ? " finished " : " failed "), ""], [str(b.id), "mono"]]);
+        mark("reqs"); scheduleStateRefresh();
+        break;
+      }
+
+      case "request.decline": {
+        var rd = S.reqs.get(str(b.id));
+        if (rd && REQ_TERMINAL.indexOf(rd.state) < 0) {
+          rd.state = "declined";
+          rd.decline_code = str(b.code) || "other";
+          rd.decline_reason = str(b.reason);
+          rd.terminal_at = ev.ts;
+          rd.needs_consent = false;
+        }
+        sysLine(ev, t, [[agentName(actor), "b"], [" declined ", ""], [str(b.id), "mono"],
+          [str(b.code) ? " — " + str(b.code) : "", ""]]);
+        mark("reqs"); scheduleStateRefresh();
+        break;
+      }
+
+      case "request.cancel": {
+        var rc = S.reqs.get(str(b.id));
+        if (rc && REQ_TERMINAL.indexOf(rc.state) < 0) {
+          rc.state = "cancelled";
+          rc.decline_reason = str(b.reason);
+          rc.terminal_at = ev.ts;
+          rc.needs_consent = false;
+        }
+        sysLine(ev, t, [[agentName(actor), "b"], [" withdrew ", ""], [str(b.id), "mono"]]);
+        mark("reqs"); scheduleStateRefresh();
+        break;
+      }
+
+      case "request.expired": {
+        var rx = S.reqs.get(str(b.id));
+        var abandoned = b.abandoned === true;
+        if (rx && REQ_TERMINAL.indexOf(rx.state) < 0) {
+          rx.state = "expired";
+          rx.abandoned = abandoned;
+          rx.terminal_at = ev.ts;
+          rx.needs_consent = false;
+        }
+        var provider = str(b.provider) || (rx && (rx.accepted_by || rx.to)) || "";
+        sysLine(ev, t, [[str(b.id), "mono"],
+          [" expired — " + (str(b.reason) || "nobody answered in time"), ""]]);
+        if (abandoned) {
+          /* The one unforgivable Exchange behaviour (SPEC §15.3), and the only
+             thing in the whole Ledger that subtracts. Worth saying out loud. */
+          announce(agentName(provider) + " accepted a request and never answered it.");
+        }
+        mark("reqs"); scheduleStateRefresh();
+        break;
+      }
+
+      case "request.taken": {
+        var rt = S.reqs.get(str(b.id));
+        if (rt && !rt.accepted_by) rt.accepted_by = str(b.by);
+        mark("reqs");
+        break;
+      }
 
       default:
         /* Unknown and x.* types are stored, shown as a bare line, never parsed. */
@@ -1111,6 +1433,7 @@
   function renderAttention() {
     var list = $("attnList");
     clear(list);
+    consentClocks.length = 0;
     var items = [];
 
     S.agents.forEach(function (a) {
@@ -1145,7 +1468,790 @@
       list.appendChild(li);
     });
 
-    show($("attn"), items.length > 0);
+    /* Consent prompts are the human-in-the-loop surface for the whole §15.4
+       model, so they belong here with the other things only a person can clear
+       — but only when this Deck actually holds a host token. Without one the
+       buttons would be theatre, so the Requests panel points at the CLI
+       instead (see renderConsentNote). */
+    var consent = HST ? consentList() : [];
+    consent.forEach(function (c) {
+      list.appendChild(consentPrompt(c));
+    });
+
+    show($("attn"), (items.length + consent.length) > 0);
+  }
+
+  /* ================================================== 12b. the Exchange: caps
+   * "What each agent can do for the others" (SPEC §8.1 item 8, §15.1).
+   *
+   * Grouped by agent because the question this panel answers is not "what
+   * capabilities exist" but "who should I ask". Inside a group, `exclusive`
+   * sorts first and is washed in the accent: an exclusive capability is the
+   * entire argument for holding a parley instead of working alone, and it has
+   * to survive being glanced at. `dangerous` carries the reserved critical
+   * colour and a four-pixel hazard band — the bench convention, not an
+   * exclamation mark.
+   *
+   * An offline agent keeps its capabilities on the Deck, marked unavailable.
+   * Dropping them would quietly turn "the only machine wired to the hardware is
+   * asleep" into "nobody can reach the hardware", which is a different and much
+   * less actionable fact.
+   * ====================================================================== */
+
+  var capOpen = new Set();   // "<agent> <name>" of descriptions read in full
+
+  function renderCaps() {
+    var host = $("capGroups");
+    clear(host);
+    var meta = $("capsMeta");
+
+    if (!S.capsKey) {
+      host.appendChild(el("p", "empty",
+        "This Hub has not sent a capability registry. Nothing is missing from the parley — this Deck simply cannot see what the agents offer each other."));
+      meta.textContent = "";
+      return;
+    }
+
+    var rows = S.caps || [];
+    var byAgent = new Map();
+    rows.forEach(function (c) {
+      var k = c.agent_id || "";
+      if (!byAgent.has(k)) byAgent.set(k, []);
+      byAgent.get(k).push(c);
+    });
+
+    /* Every enrolled agent gets a group, even an empty one: an agent that has
+       announced nothing is a visible fact, not an absence. */
+    var ids = S.order.filter(function (id) { return S.agents.has(id); });
+    S.agents.forEach(function (a, id) { if (ids.indexOf(id) < 0) ids.push(id); });
+    byAgent.forEach(function (_v, id) { if (id && ids.indexOf(id) < 0) ids.push(id); });
+
+    if (!ids.length) {
+      host.appendChild(el("p", "empty", "Nobody has enrolled yet, so nobody has anything to lend."));
+      meta.textContent = "";
+      return;
+    }
+
+    var nExcl = 0, nDanger = 0;
+    rows.forEach(function (c) { if (c.exclusive) nExcl++; if (c.safety === "dangerous") nDanger++; });
+
+    ids.sort(function (x, y) {
+      var cx = byAgent.get(x) || [], cy = byAgent.get(y) || [];
+      if (!cx.length !== !cy.length) return cx.length ? -1 : 1;
+      var ex = cx.filter(function (c) { return c.exclusive; }).length;
+      var ey = cy.filter(function (c) { return c.exclusive; }).length;
+      if (ex !== ey) return ey - ex;
+      if (cx.length !== cy.length) return cy.length - cx.length;
+      return String(agentName(x)).localeCompare(String(agentName(y)));
+    });
+
+    ids.forEach(function (id) {
+      host.appendChild(capGroup(id, byAgent.get(id) || []));
+    });
+
+    meta.textContent = rows.length + (rows.length === 1 ? " capability" : " capabilities") +
+      " · " + nExcl + " exclusive" + (nDanger ? " · " + nDanger + " dangerous" : "");
+  }
+
+  function capGroup(agentId, caps) {
+    var a = agentOf(agentId);
+    var who = a || { agent_id: agentId, name: (caps[0] && caps[0].agent_name) || agentId };
+    /* "Available" is stricter than "online": an agent still waiting for the
+       host to approve it cannot be asked for anything, and one that was revoked
+       certainly cannot. Its catalogue still shows — it is a fact about the
+       parley — but it shows as unreachable. */
+    var why = "";
+    if (a && a.status === "pending") why = "pending approval — unavailable";
+    else if (a && a.status === "revoked") why = "revoked — unavailable";
+    else if (a ? a.online === false : !(caps.length && caps[0].online)) why = "offline — unavailable";
+    var online = !why;
+
+    var box = el("div", "capgroup" + (online ? "" : " capgroup--off"));
+    var head = el("div", "capgroup__head");
+    head.appendChild(flagFor(who, "sm"));
+    head.appendChild(el("span", "capgroup__name", who.name));
+    if (why) head.appendChild(badgeOf("unavail", why));
+    var m = el("span", "capgroup__meta");
+    m.textContent = caps.length
+      ? caps.length + (caps.length === 1 ? " capability" : " capabilities")
+      : "nothing announced";
+    head.appendChild(m);
+    box.appendChild(head);
+
+    if (!caps.length) {
+      box.appendChild(el("p", "capgroup__none",
+        "Has announced no capabilities. The others cannot ask it for anything — only talk to it."));
+      return box;
+    }
+
+    caps = caps.slice().sort(function (p, q) {
+      if (p.exclusive !== q.exclusive) return p.exclusive ? -1 : 1;
+      var dp = p.safety === "dangerous", dq = q.safety === "dangerous";
+      if (dp !== dq) return dp ? -1 : 1;
+      return String(p.name).localeCompare(String(q.name));
+    });
+
+    var grid = el("div", "capgrid");
+    caps.forEach(function (c) { grid.appendChild(capCard(c, who, online, why)); });
+    box.appendChild(grid);
+    return box;
+  }
+
+  function capCard(c, who, online, why) {
+    var card = el("div", "capcard" +
+      (c.exclusive ? " capcard--exclusive" : "") +
+      (c.safety === "dangerous" ? " capcard--dangerous" : ""));
+
+    var top = el("div", "capcard__top");
+    var kind = el("span", "kindchip", c.kind || "tool");
+    kind.setAttribute("title", "kind: " + (c.kind || "tool"));
+    top.appendChild(kind);
+    top.appendChild(el("span", "capname", c.name || "(unnamed)"));
+    card.appendChild(top);
+
+    if (c.title) card.appendChild(el("p", "captitle", c.title));
+
+    var flags = el("div", "capflags");
+    if (c.exclusive) {
+      var ex = badgeOf("excl", "only " + (who.name || "this agent"));
+      ex.setAttribute("title",
+        "No other agent in this parley has announced this capability. It is why the parley is worth more than these agents working alone.");
+      flags.appendChild(ex);
+    }
+    var safety = c.safety || "guarded";
+    var skey = safety === "dangerous" ? "danger" : safety === "safe" ? "safe"
+             : safety === "guarded" ? "guarded" : "unavail";
+    var sb = badgeOf(skey, SAFETY_LABEL[safety] || ("safety: " + safety));
+    sb.setAttribute("title", safety === "dangerous"
+      ? "Declared dangerous: it may never be auto-accepted. Every single call needs an explicit human approval (SPEC §15.4)."
+      : safety === "safe"
+        ? "Declared safe: read-only, no side effects outside the workspace. May be auto-accepted."
+        : safety === "guarded"
+          ? "Declared guarded: never auto-accepted unless the provider's own policy names this capability and this requester."
+          : "The provider declared a safety level the Deck does not recognise. Treat it as at least guarded.");
+    flags.appendChild(sb);
+    if (c.cost) flags.appendChild(badgeOf("cost", c.cost));
+    if (!online) flags.appendChild(badgeOf("unavail", "unavailable"));
+    card.appendChild(flags);
+
+    /* The description is the single highest-value field in the Exchange — it is
+       what another model reads to decide whether to ask. Clamping it is fine;
+       truncating it away is not. */
+    if (c.description) {
+      var key = (c.agent_id || "") + " " + (c.name || "");
+      var longish = c.description.length > 168;
+      var open = capOpen.has(key);
+      var p = el("p", "capdesc" + (longish && !open ? " is-clamped" : ""), c.description);
+      card.appendChild(p);
+      if (longish) {
+        var more = el("button", "capmore", open ? "show less" : "read the whole description");
+        more.type = "button";
+        more.setAttribute("aria-expanded", open ? "true" : "false");
+        more.addEventListener("click", function () {
+          if (capOpen.has(key)) capOpen.delete(key); else capOpen.add(key);
+          renderCaps();
+        });
+        card.appendChild(more);
+      }
+    }
+
+    var schema = c.input_schema;
+    if (schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object") {
+      var req = Array.isArray(schema.required) ? schema.required.map(str) : [];
+      var keys = Object.keys(schema.properties);
+      if (keys.length) {
+        var sc = el("div", "capschema");
+        sc.appendChild(el("span", "capschema__lbl", "takes"));
+        keys.slice(0, 7).forEach(function (k) {
+          var isReq = req.indexOf(k) >= 0;
+          var chip = el("span", "capkey" + (isReq ? " capkey--req" : ""), k + (isReq ? "*" : ""));
+          chip.setAttribute("title", isReq ? k + " (required)" : k + " (optional)");
+          sc.appendChild(chip);
+        });
+        if (keys.length > 7) sc.appendChild(el("span", "capkey", "+" + (keys.length - 7)));
+        card.appendChild(sc);
+      }
+    }
+
+    card.appendChild(capSlots(c, who, online, why));
+
+    var foot = el("div", "capfoot");
+    foot.appendChild(el("span", null, "returns " + (c.output || "text")));
+    if (c.avg_duration_s > 0) foot.appendChild(el("span", null, "~" + fmtAge(c.avg_duration_s) + " typical"));
+    card.appendChild(foot);
+    return card;
+  }
+
+  /* Discrete berths rather than a percentage: `concurrency` is a small integer
+     the provider published, and "2 of 2 taken" is a thing you can count. */
+  function capSlots(c, who, online, why) {
+    var cap = Math.max(0, c.concurrency || 0);
+    var live = S.reqsKey ? liveInFlight(c.agent_id, c.name) : 0;
+    var used = Math.max(c.in_flight || 0, live);
+    var full = cap > 0 && used >= cap;
+
+    var box = el("div", "slots" + (full ? " is-full" : ""));
+    if (online && cap > 0 && cap <= 8) {
+      var cells = el("span", "slots__cells");
+      cells.setAttribute("aria-hidden", "true");
+      for (var i = 0; i < cap; i++) {
+        var cell = el("span", "slots__cell" + (i < used ? " is-on" : ""));
+        if (i < used) cell.style.setProperty("--a", agentColor(who.agent_id));
+        cells.appendChild(cell);
+      }
+      box.appendChild(cells);
+    }
+    var txt = el("span", "slots__txt");
+    if (!online) {
+      txt.textContent = (why || "unavailable").split(" — ")[0] + " — asking will be declined";
+    } else if (cap > 0) {
+      txt.textContent = used + " of " + cap + " in flight" + (full ? " · at capacity" : "");
+    } else {
+      txt.textContent = used + " in flight · no limit declared";
+    }
+    box.appendChild(txt);
+    return box;
+  }
+
+  function liveInFlight(agentId, name) {
+    var n = 0;
+    S.reqs.forEach(function (r) {
+      if (r.state !== "accepted") return;
+      if ((r.accepted_by || r.to) !== agentId) return;
+      if (name && r.capability && r.capability !== name) return;
+      if (name && !r.capability) return;          // free-form work is not this capability
+      n++;
+    });
+    return n;
+  }
+
+  function badgeOf(kind, label) {
+    var b = el("span", "badge badge--" + kind);
+    b.appendChild(document.createTextNode(label));
+    return b;
+  }
+
+  /* ============================================== 12c. requests in flight
+   * The delegation view (SPEC §8.1 item 9, §15.3): who asked whom for what, how
+   * long ago, and how close it is to running out. Live work is a card; settled
+   * work drops into a quiet single-line history, because a finished request
+   * should stop competing for attention the moment it finishes.
+   * ====================================================================== */
+
+  var reqNodes = new Map();       // id -> the few nodes a progress/clock tick writes into
+  var consentClocks = [];         // countdown nodes in the attention strip
+  var reqHistAll = false;
+  var reqReasonOpen = new Set();
+
+  function renderRequests() {
+    var live = $("reqsLive");
+    clear(live);
+    reqNodes.clear();
+    var meta = $("reqsMeta");
+
+    if (!S.reqsKey) {
+      live.appendChild(el("p", "empty",
+        "This Hub has not sent the Exchange's request log. Agents may still be delegating work to each other — this Deck cannot see it."));
+      meta.textContent = "";
+      show($("reqsHistSec"), false);
+      renderConsentNote();
+      return;
+    }
+
+    var all = [];
+    S.reqs.forEach(function (r) { all.push(r); });
+    var inflight = all.filter(function (r) { return r.state === "pending" || r.state === "accepted"; });
+    var settled = all.filter(function (r) { return REQ_TERMINAL.indexOf(r.state) >= 0; });
+
+    /* Sorted by absolute deadline, soonest first. A fixed ordering, so the list
+       does not re-shuffle under the reader every time a second passes. */
+    inflight.sort(function (p, q) {
+      var dp = reqDeadlineMs(p), dq = reqDeadlineMs(q);
+      if (!isFinite(dp)) dp = Infinity;
+      if (!isFinite(dq)) dq = Infinity;
+      if (dp !== dq) return dp - dq;
+      return String(p.id).localeCompare(String(q.id));
+    });
+    settled.sort(function (p, q) {
+      var ep = reqEndMs(p), eq = reqEndMs(q);
+      return (isFinite(eq) ? eq : 0) - (isFinite(ep) ? ep : 0);
+    });
+
+    if (!inflight.length) {
+      live.appendChild(el("p", "empty", settled.length
+        ? "Nothing in flight. Every request has been answered."
+        : "No delegated work yet. Agents ask each other with “parley ask” and “parley instruct”."));
+    } else {
+      inflight.forEach(function (r) { live.appendChild(reqCard(r)); });
+    }
+
+    var consentN = consentList().length;
+    meta.textContent = inflight.length + " in flight" +
+      (consentN ? " · " + consentN + " awaiting consent" : "") +
+      (settled.length ? " · " + settled.length + " settled" : "");
+
+    renderReqHistory(settled);
+    renderConsentNote();
+    paintReqClocks();
+  }
+
+  function reqCard(r) {
+    var clock = reqClock(r);
+    var expiring = !!(clock && (clock.level === "crit") && r.state !== "done");
+    var card = el("div", "req" +
+      (r.needs_consent ? " req--consent" : "") +
+      (expiring ? " req--expiring" : ""));
+
+    var top = el("div", "req__top");
+    top.appendChild(whoChip(agentOf(r.from) || { agent_id: r.from, name: r.from || "unknown" }, "sm"));
+    var arrow = el("span", "req__arrow", "→");
+    arrow.setAttribute("aria-label", "asked");
+    top.appendChild(arrow);
+    top.appendChild(reqTargetChip(r));
+    top.appendChild(reqStateChip(r));
+    if (!r.capability) {
+      var ff = el("span", "rchip rchip--free", "free-form");
+      ff.setAttribute("title",
+        "A natural-language instruction, not a registered capability. SPEC §15.4 rule 2: nobody validated it against a schema, so it is never treated as safe.");
+      top.appendChild(ff);
+    }
+    var idn = el("span", "req__id", r.id);
+    idn.setAttribute("title", "request id " + r.id);
+    top.appendChild(idn);
+    card.appendChild(top);
+
+    var ask = el("p", "req__ask" + (r.capability ? "" : " req__instruction"));
+    if (r.capability) {
+      ask.appendChild(el("span", "req__cap", r.capability));
+    } else {
+      ask.appendChild(document.createTextNode(r.instruction || "(no instruction given)"));
+    }
+    card.appendChild(ask);
+
+    if (r.reason) card.appendChild(reqReason(r));
+
+    /* Progress, when the provider sends it. The nodes are remembered so a burst
+       of request.progress can write into them without rebuilding the card. */
+    var refs = { row: card };
+    if (r.state === "accepted") {
+      var m = el("div", "meter");
+      var track = el("div", "meter__track");
+      var fill = el("div", "meter__fill");
+      var pv = (r.progress === null || !isFinite(r.progress)) ? 0 : r.progress;
+      fill.style.width = (pv * 100) + "%";
+      fill.style.setProperty("--a", agentColor(r.accepted_by || r.to));
+      track.appendChild(fill);
+      m.appendChild(track);
+      var val = el("span", "meter__val", Math.round(pv * 100) + "%");
+      m.appendChild(val);
+      /* `progress` is optional. An empty track with a dash in it looks like a
+         bug rather than like "the provider has not said"; the bar appears the
+         moment the first request.progress does. */
+      show(m, r.progress !== null);
+      card.appendChild(m);
+      refs.meter = m; refs.fill = fill; refs.val = val;
+
+      var note = el("p", "req__note", r.note || "");
+      show(note, !!r.note);
+      card.appendChild(note);
+      refs.note = note;
+    }
+
+    if (clock) {
+      var g = el("div", "gauge" + (clock.level ? " is-" + clock.level : ""));
+      var gt = el("div", "gauge__track");
+      var gf = el("div", "gauge__fill");
+      gf.style.width = (clock.frac * 100) + "%";
+      gt.appendChild(gf);
+      g.appendChild(gt);
+      var gx = el("span", "gauge__txt", clockText(clock, r));
+      g.appendChild(gx);
+      g.setAttribute("title",
+        "Elapsed against the caller's timeout_s of " + fmtDur(r.timeout_s) +
+        ". When it runs out the Hub expires the request" +
+        (r.state === "accepted" ? " and charges the provider for abandoning it." : "."));
+      card.appendChild(g);
+      refs.gauge = g; refs.gfill = gf; refs.gtext = gx;
+    }
+
+    reqNodes.set(r.id, refs);
+    return card;
+  }
+
+  function reqTargetChip(r) {
+    if (r.to === "any") {
+      var any = el("span", "whochip");
+      any.appendChild(el("span", "flag flag--sm flag--off"));
+      any.appendChild(el("span", "whochip__name", r.accepted_by ? agentName(r.accepted_by) : "anyone"));
+      any.setAttribute("title", r.accepted_by
+        ? "Offered to anyone who holds this capability; " + agentName(r.accepted_by) + " took it."
+        : "Offered to anyone who holds this capability. The first to accept wins.");
+      return any;
+    }
+    var id = r.accepted_by || r.to;
+    return whoChip(agentOf(id) || { agent_id: id, name: id || "unknown" }, "sm");
+  }
+
+  function reqStateChip(r) {
+    var label = r.state;
+    if (r.state === "pending" && r.needs_consent) label = "needs consent";
+    if (r.state === "expired" && r.abandoned) label = "abandoned";
+    var cls = r.state === "expired" && r.abandoned ? "abandoned" : r.state;
+    var chip = el("span", "rchip rchip--" + cls);
+    chip.appendChild(el("span", "rchip__dot"));
+    chip.appendChild(document.createTextNode(label));
+    chip.setAttribute("title", reqStateHelp(r));
+    return chip;
+  }
+
+  function reqStateHelp(r) {
+    switch (r.state) {
+      case "pending": return "Sent. The provider has not yet accepted or declined it.";
+      case "accepted": return "The provider committed to it. Having accepted, it must answer or decline — never go quiet.";
+      case "done": return "Answered successfully.";
+      case "failed": return "The provider answered and said it did not work. Failing honestly costs nothing in the Ledger.";
+      case "declined": return "Refused. Declining is always acceptable and is never a fault.";
+      case "cancelled": return "The caller withdrew it.";
+      case "expired": return r.abandoned
+        ? "Accepted and then never answered. This is the one unforgivable Exchange behaviour, and the only thing in the Ledger that subtracts."
+        : "Nobody answered within the caller's timeout_s.";
+      default: return r.state;
+    }
+  }
+
+  /* `reason` is mandatory on every request precisely so the audit trail means
+     something, so it is shown, not hidden behind a hover. */
+  function reqReason(r) {
+    var open = reqReasonOpen.has(r.id);
+    var box = el("p", "req__reason");
+    box.appendChild(el("b", null, "why: "));
+    var span = el("span", null, open || r.reason.length <= 150
+      ? r.reason
+      : r.reason.slice(0, 150) + "…");
+    box.appendChild(span);
+    if (r.reason.length > 150) {
+      box.appendChild(document.createTextNode(" "));
+      var b = el("button", "capmore", open ? "less" : "more");
+      b.type = "button";
+      b.setAttribute("aria-expanded", open ? "true" : "false");
+      b.addEventListener("click", function () {
+        if (reqReasonOpen.has(r.id)) reqReasonOpen.delete(r.id); else reqReasonOpen.add(r.id);
+        mark("reqs");
+      });
+      box.appendChild(b);
+    }
+    return box;
+  }
+
+  function renderReqHistory(settled) {
+    var sec = $("reqsHistSec"), host = $("reqsHist"), btn = $("reqsMoreBtn");
+    clear(host);
+    if (!settled.length) { show(sec, false); show(btn, false); return; }
+    show(sec, true);
+
+    var shown = reqHistAll ? settled : settled.slice(0, REQ_HISTORY_PAGE);
+    shown.forEach(function (r) { host.appendChild(reqHistRow(r)); });
+
+    if (settled.length > REQ_HISTORY_PAGE) {
+      btn.textContent = reqHistAll
+        ? "Show the latest " + REQ_HISTORY_PAGE
+        : "Show all " + settled.length + " settled requests";
+      btn.setAttribute("aria-expanded", reqHistAll ? "true" : "false");
+      show(btn, true);
+    } else {
+      show(btn, false);
+    }
+
+    /* The Hub keeps the full tally but only ships the most recent records, so
+       say so rather than letting the list imply it is everything. */
+    var total = terminalTotal();
+    if (total > settled.length) {
+      host.appendChild(el("p", "note",
+        "The Hub has settled " + total + " requests in this parley; it sends the Deck the most " +
+        "recent " + settled.length + ". The whole history is in the log."));
+    }
+  }
+
+  function terminalTotal() {
+    var c = S.reqCounts;
+    if (!c) return 0;
+    var n = 0;
+    REQ_TERMINAL.forEach(function (st) {
+      var v = c[st];
+      if (typeof v === "number" && isFinite(v)) n += v;
+    });
+    return n;
+  }
+
+  function reqHistRow(r) {
+    var row = el("div", "reqhist__row");
+    row.appendChild(reqStateChip(r));
+    var what = el("span", "reqhist__what");
+    what.textContent = agentName(r.from) + " → " +
+      agentName(r.accepted_by || r.to) + " · " + (r.capability || "free-form");
+    row.appendChild(what);
+
+    var why = el("span", "reqhist__why");
+    if (r.state === "declined") {
+      why.textContent = (r.decline_code ? r.decline_code + " — " : "") + (r.decline_reason || "no reason given");
+    } else if (r.state === "failed") {
+      why.textContent = (r.error && (r.error.message || r.error.code)) || "no error detail";
+    } else if (r.state === "cancelled") {
+      why.textContent = r.decline_reason || "withdrawn by the caller";
+    } else if (r.state === "expired") {
+      why.textContent = r.abandoned
+        ? "accepted and never answered — charged against " + agentName(r.accepted_by || r.to) + " in the Ledger"
+        : "nobody answered within " + fmtDur(r.timeout_s);
+    } else {
+      why.textContent = r.output_text || (r.files.length ? r.files.join(", ") : "answered");
+    }
+    row.appendChild(why);
+
+    var when = el("span", "reqhist__when");
+    var end = reqEndMs(r);
+    when.textContent = (r.duration_s > 0 ? fmtAge(r.duration_s) + " · " : "") +
+      (isFinite(end) ? fmtAge((nowMs() - end) / 1000) + " ago" : "—");
+    row.appendChild(when);
+    return row;
+  }
+
+  function reqClock(r) {
+    if (REQ_TERMINAL.indexOf(r.state) >= 0) return null;
+    var start = reqStartMs(r), dl = reqDeadlineMs(r);
+    if (!isFinite(start) || !isFinite(dl)) return null;
+    var now = nowMs();
+    var total = Math.max(1000, dl - start);
+    var elapsed = Math.max(0, now - start);
+    var leftS = (dl - now) / 1000;
+    return {
+      frac: Math.max(0, Math.min(1, elapsed / total)),
+      elapsedS: elapsed / 1000,
+      leftS: leftS,
+      level: leftS <= 0 ? "crit"
+           : (leftS <= 45 || elapsed / total >= 0.9) ? "crit"
+           : (leftS <= 120 || elapsed / total >= 0.7) ? "warn" : ""
+    };
+  }
+
+  function clockText(clock, r) {
+    if (clock.leftS <= 0) {
+      return "overdue by " + fmtLeft(-clock.leftS) + " · the Hub will expire it";
+    }
+    return fmtLeft(clock.elapsedS) + " elapsed · " + fmtLeft(clock.leftS) + " left of " + fmtDur(r.timeout_s);
+  }
+
+  function fmtLeft(sec) {
+    if (!isFinite(sec)) return "—";
+    var s = Math.max(0, Math.round(sec));
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+    return fmtAge(s);
+  }
+
+  /* Targeted repaint: the only nodes a progress burst is allowed to touch. */
+  function paintReqProgress() {
+    reqProgressDirty.forEach(function (id) {
+      var refs = reqNodes.get(id), r = S.reqs.get(id);
+      if (!refs || !r) return;
+      if (refs.fill) {
+        var pv = (r.progress === null || !isFinite(r.progress)) ? 0 : r.progress;
+        refs.fill.style.width = (pv * 100) + "%";
+        if (refs.val) refs.val.textContent = Math.round(pv * 100) + "%";
+        if (refs.meter) show(refs.meter, r.progress !== null);
+      }
+      if (refs.note) {
+        refs.note.textContent = r.note || "";
+        show(refs.note, !!r.note);
+      }
+    });
+    reqProgressDirty.clear();
+  }
+
+  /* Clocks move on their own. They are repainted from the one-second tick in
+     place — never by re-rendering the panel, which would throw away scroll
+     position and expanded reasons once a second. */
+  function paintReqClocks() {
+    reqNodes.forEach(function (refs, id) {
+      var r = S.reqs.get(id);
+      if (!r || !refs.gauge) return;
+      var c = reqClock(r);
+      if (!c) return;
+      refs.gfill.style.width = (c.frac * 100) + "%";
+      refs.gtext.textContent = clockText(c, r);
+      refs.gauge.className = "gauge" + (c.level ? " is-" + c.level : "");
+      if (refs.row) {
+        refs.row.classList.toggle("req--expiring", c.level === "crit");
+      }
+    });
+    var now = nowMs();
+    consentClocks.forEach(function (cc) {
+      if (!isFinite(cc.deadline)) return;
+      var left = (cc.deadline - now) / 1000;
+      cc.node.textContent = left > 0
+        ? "auto-declines in " + fmtLeft(left)
+        : "past its deadline — being auto-declined";
+      cc.node.classList.toggle("is-crit", left <= 45);
+    });
+  }
+
+  /* =============================================== 12d. consent (§15.4)
+   * A request is a proposal, not a command, and `ask` means a person decides.
+   * The Deck is one of the three places that decision can be made (the CLI and
+   * Pigeonhole's pending.json are the others), and it only ever claims to be
+   * one of them when it actually holds a host token.
+   * ====================================================================== */
+
+  function consentList() {
+    var out = [], seen = Object.create(null);
+    (S.consentRaw || []).forEach(function (e) {
+      if (!e || typeof e !== "object") return;
+      var id = str(e.id);
+      if (!id || seen[id]) return;
+      var rec = S.reqs.get(id) || null;
+      if (rec && REQ_TERMINAL.indexOf(rec.state) >= 0) return;   // already answered
+      seen[id] = true;
+      out.push({
+        id: id,
+        from: str(e.from) || (rec ? rec.from : ""),
+        capability: str(e.capability) || (rec ? rec.capability : ""),
+        instruction: str(e.instruction) || (rec ? rec.instruction : ""),
+        reason: str(e.reason) || (rec ? rec.reason : ""),
+        safety: str(e.safety) || (rec ? rec.safety : "") || "guarded",
+        why: str(e.why),
+        detail: str(e.detail),
+        deadline: consentDeadline(e, rec)
+      });
+    });
+    S.reqs.forEach(function (r) {
+      if (seen[r.id] || !r.needs_consent || r.state !== "pending") return;
+      seen[r.id] = true;
+      out.push({
+        id: r.id, from: r.from, capability: r.capability, instruction: r.instruction,
+        reason: r.reason, safety: r.safety || "guarded", why: r.why, detail: "",
+        deadline: reqDeadlineMs(r)
+      });
+    });
+    out.sort(function (p, q) {
+      var dp = isFinite(p.deadline) ? p.deadline : Infinity;
+      var dq = isFinite(q.deadline) ? q.deadline : Infinity;
+      return dp - dq;
+    });
+    return out;
+  }
+
+  function consentDeadline(e, rec) {
+    var d = num(e.deadline_ts);
+    if (d > 0) return d * 1000;
+    if (rec) return reqDeadlineMs(rec);
+    var asked = parseTs(e.asked_at);
+    var to = num(e.timeout_s, DEFAULT_TIMEOUT_S) || DEFAULT_TIMEOUT_S;
+    return isFinite(asked) ? asked + to * 1000 : NaN;
+  }
+
+  function consentPrompt(c) {
+    var li = el("li", "attn__item attn__item--consent");
+    li.appendChild(el("span", "attn__kind attn__kind--consent", "consent"));
+
+    var box = el("div", "consent");
+
+    var top = el("div", "consent__top");
+    top.appendChild(whoChip(agentOf(c.from) || { agent_id: c.from, name: c.from || "unknown" }, "sm"));
+    top.appendChild(el("span", "req__arrow", "asks to run"));
+    var safety = c.safety || "guarded";
+    var skey = safety === "dangerous" ? "danger" : safety === "safe" ? "safe"
+             : safety === "guarded" ? "guarded" : "unavail";
+    top.appendChild(badgeOf(skey, SAFETY_LABEL[safety] || ("safety: " + safety)));
+    var clock = el("span", "gauge__txt");
+    top.appendChild(clock);
+    consentClocks.push({ node: clock, deadline: c.deadline });
+    box.appendChild(top);
+
+    var ask = el("p", "consent__ask");
+    if (c.capability) ask.appendChild(el("span", "req__cap", c.capability));
+    else ask.appendChild(document.createTextNode(c.instruction || "(a free-form instruction with no text)"));
+    box.appendChild(ask);
+
+    var reason = el("p", "req__reason");
+    reason.appendChild(el("b", null, "their reason: "));
+    reason.appendChild(document.createTextNode(c.reason || "none given"));
+    box.appendChild(reason);
+
+    if (c.why || c.detail) {
+      var why = el("p", "req__reason");
+      why.appendChild(el("b", null, "your policy says: "));
+      why.appendChild(document.createTextNode([c.why, c.detail].filter(Boolean).join(" — ")));
+      box.appendChild(why);
+    }
+
+    var acts = el("div", "consent__acts");
+    var ok = el("button", "btn btn--primary", "Accept");
+    ok.type = "button";
+    var no = el("button", "btn btn--danger", "Decline");
+    no.type = "button";
+    ok.addEventListener("click", function () { consentAct(c, box, acts, "accept"); });
+    no.addEventListener("click", function () { consentAct(c, box, acts, "decline"); });
+    acts.appendChild(ok);
+    acts.appendChild(no);
+    var idc = el("span", "consent__cli", c.id);
+    idc.setAttribute("title", "request id — the same decision can be made with “parley accept” or “parley decline” on the machine running that agent");
+    acts.appendChild(idc);
+    box.appendChild(acts);
+
+    li.appendChild(box);
+    return li;
+  }
+
+  function consentAct(c, box, acts, what) {
+    Array.prototype.forEach.call(acts.querySelectorAll("button"), function (b) { b.disabled = true; });
+    var body = what === "accept"
+      ? { id: c.id }
+      : { id: c.id, reason: "declined by the host from the Deck", code: "policy" };
+    adminPost("/v1/admin/request-" + what, body)
+      .then(function () {
+        var rec = S.reqs.get(c.id);
+        if (rec) {
+          rec.needs_consent = false;
+          if (what === "decline" && REQ_TERMINAL.indexOf(rec.state) < 0) {
+            rec.state = "declined";
+            rec.decline_code = "policy";
+            rec.decline_reason = "declined by the host from the Deck";
+            rec.terminal_at = new Date(nowMs()).toISOString();
+          }
+        }
+        S.consentRaw = (S.consentRaw || []).filter(function (e) { return str(e.id) !== c.id; });
+        mark("reqs"); mark("roster");
+        scheduleStateRefresh();
+      })
+      .catch(function (err) {
+        /* The Hub may simply not expose this action. Say so, and hand over the
+           command that definitely works instead of leaving a dead button. */
+        var old = box.querySelector(".consent__err");
+        if (old) old.remove();
+        box.appendChild(el("p", "consent__err",
+          "The Hub would not take that from the Deck (" + (err && err.message ? err.message : "no reason given") +
+          "). Answer it on the machine running that agent instead:"));
+        box.appendChild(el("p", "consent__cli", what === "accept"
+          ? "parley accept " + c.id
+          : "parley decline " + c.id + " --reason \"…\""));
+      });
+  }
+
+  function renderConsentNote() {
+    var sec = $("reqsConsentSec"), note = $("reqsConsentNote");
+    var n = consentList().length;
+    if (!n || HST) { show(sec, false); return; }
+    clear(note);
+    note.appendChild(el("b", null,
+      n + (n === 1 ? " request is" : " requests are") + " waiting on an operator's consent."));
+    note.appendChild(document.createTextNode(
+      " This Deck has no host token, so it can only show them. Answer on the machine running that agent: "));
+    note.appendChild(el("code", null, "parley requests --pending"));
+    note.appendChild(document.createTextNode(", then "));
+    note.appendChild(el("code", null, "parley accept <id>"));
+    note.appendChild(document.createTextNode(" or "));
+    note.appendChild(el("code", null, "parley decline <id> --reason \"…\""));
+    note.appendChild(document.createTextNode(". An unanswered ask is auto-declined when its timeout runs out."));
+    show(sec, true);
   }
 
   /* ============================================================= 13. ledger */
@@ -1165,18 +2271,51 @@
       return;
     }
     lines.sort(function (a, b) { return (b.total || 0) - (a.total || 0); });
-    var max = Math.max.apply(null, lines.map(function (l) { return l.total || 0; })) || 1;
+    /* Scale on *gross* earned points, not on the net total. `service` is the one
+       component that can go negative (§15.5's abandoned-request penalty), and a
+       bar scaled on a net total has nowhere to draw the part that was taken
+       back. Gross gives the deduction a length. */
+    var anyPenalty = false;
+    var max = 0;
+    lines.forEach(function (l) {
+      var p = ledgerParts(l);
+      if (p.gross > max) max = p.gross;
+      if (p.penalty > 0) anyPenalty = true;
+    });
+    if (!(max > 0)) max = 1;
     var sum = lines.reduce(function (s, l) { return s + (l.total || 0); }, 0);
 
-    lines.forEach(function (line) {
-      host.appendChild(ledgerRow(line, max, sum));
+    lines.forEach(function (line, i) {
+      host.appendChild(ledgerRow(line, max, sum, i));
     });
+    show($("ledgerLegendPenalty"), anyPenalty);
     $("ledgerMeta").textContent = fmtNum(sum, 1) + " pts · " +
       (L && L.event_count ? L.event_count + " events" : "");
     layoutLedgerBars();
   }
 
-  function ledgerRow(line, max, sum) {
+  /* Split a Ledger line into what it earned and what was taken back. */
+  function ledgerParts(line) {
+    var comps = (line && line.components) || {};
+    var pos = [], penalty = 0;
+    LEDGER_COMPONENTS.forEach(function (c) {
+      var v = comps[c[0]];
+      v = (typeof v === "number" && isFinite(v)) ? v : 0;
+      pos.push(v > 0 ? v : 0);
+      if (v < 0) penalty += -v;
+    });
+    var gross = pos.reduce(function (a, b) { return a + b; }, 0);
+    return { pos: pos, gross: gross, penalty: penalty, net: gross - penalty };
+  }
+
+  /* A true minus sign, and never a bare "-5.00" that reads as a hyphen. */
+  function fmtSigned(v, dp) {
+    if (!isFinite(v)) return "—";
+    var s = fmtNum(Math.abs(v), dp);
+    return (v < 0 ? "−" : "") + s;
+  }
+
+  function ledgerRow(line, max, sum, index) {
     var wrap = el("div", "lrow");
     var open = openLedgerRows.has(line.agent_id);
     if (open) wrap.classList.add("is-open");
@@ -1195,10 +2334,16 @@
     var svg = sv("svg", { height: 18, width: "100%", "aria-hidden": "true", focusable: "false" });
     barBox.appendChild(svg);
     btn.appendChild(barBox);
-    ledgerRowBars.push({ svg: svg, line: line, max: max });
+    ledgerRowBars.push({ svg: svg, line: line, max: max, index: index || 0 });
 
+    var parts = ledgerParts(line);
     var fig = el("div", "lrow__fig");
-    fig.appendChild(el("span", "lrow__pts", fmtNum(line.total, 1)));
+    var pts = el("span", "lrow__pts" + ((line.total || 0) < 0 ? " is-negative" : ""), fmtSigned(line.total, 1));
+    if (parts.penalty > 0) {
+      pts.setAttribute("title", fmtNum(parts.gross, 2) + " earned, " +
+        fmtNum(parts.penalty, 2) + " deducted for requests accepted and never answered.");
+    }
+    fig.appendChild(pts);
     fig.appendChild(el("span", "lrow__share",
       (isFinite(line.share) ? Math.round(line.share * 100) : Math.round((line.total / (sum || 1)) * 100)) + "%"));
     fig.appendChild(el("span", "lrow__caret", open ? "▾" : "▸"));
@@ -1220,25 +2365,33 @@
     var comps = line.components || {};
     var grid = el("div", "lwhy__grid");
     LEDGER_COMPONENTS.forEach(function (c, i) {
-      var cell = el("div", "lcomp");
+      var v = comps[c[0]];
+      v = (typeof v === "number" && isFinite(v)) ? v : 0;
+      var cell = el("div", "lcomp" + (v < 0 ? " is-negative" : ""));
       var k = el("div", "lcomp__k");
       k.appendChild(el("span", "sw lc-" + (i + 1)));
       k.appendChild(document.createTextNode(c[1]));
       cell.appendChild(k);
-      cell.appendChild(el("div", "lcomp__v", fmtNum(comps[c[0]] || 0, 2)));
+      cell.appendChild(el("div", "lcomp__v", fmtSigned(v, 2)));
       cell.appendChild(el("div", "lcomp__n", c[2]));
       grid.appendChild(cell);
     });
     box.appendChild(grid);
 
     var ev = line.evidence || {};
-    var rows = [];
+    var rows = [], penalties = [];
     LEDGER_COMPONENTS.forEach(function (c, i) {
       (ev[c[0]] || []).forEach(function (e) {
-        rows.push({ comp: c[1], ci: i + 1, seq: e.seq, label: e.label, points: e.points });
+        var row = { comp: c[1], ci: i + 1, seq: e.seq, label: e.label, points: e.points };
+        if ((e.points || 0) < 0) penalties.push(row); else rows.push(row);
       });
     });
     rows.sort(function (a, b) { return (b.points || 0) - (a.points || 0); });
+    /* Deductions go first and are never cut by the 60-row window. A point the
+       user cannot trace violates R6; a *penalty* they cannot trace violates it
+       harder, because it is the one number that reads as an accusation. */
+    penalties.sort(function (a, b) { return (a.points || 0) - (b.points || 0); });
+    rows = penalties.concat(rows);
 
     if (!rows.length) {
       box.appendChild(el("p", "note", "The Hub did not send per-event evidence for this agent. The component totals above are still derived from the log."));
@@ -1254,14 +2407,15 @@
     thead.appendChild(hr); table.appendChild(thead);
     var tb = el("tbody");
     rows.slice(0, 60).forEach(function (r) {
-      var tr = el("tr");
+      var neg = (r.points || 0) < 0;
+      var tr = el("tr", neg ? "is-penalty" : "");
       tr.appendChild(el("td", "seq", isFinite(r.seq) ? "#" + r.seq : "—"));
       var td = el("td", "cmp");
-      td.appendChild(el("span", "sw lc-" + r.ci));
+      td.appendChild(el("span", neg ? "sw sw--penalty" : "sw lc-" + r.ci));
       td.appendChild(document.createTextNode(" " + r.comp));
       tr.appendChild(td);
       tr.appendChild(el("td", "lbl", String(r.label === undefined ? "" : r.label)));
-      tr.appendChild(el("td", "num", fmtNum(r.points, 2)));
+      tr.appendChild(el("td", "num", fmtSigned(r.points, 2)));
       tb.appendChild(tr);
     });
     table.appendChild(tb);
@@ -1275,7 +2429,7 @@
   function layoutLedgerBars() {
     ledgerRowBars.forEach(function (b) {
       var w = b.svg.clientWidth || b.svg.parentNode.clientWidth || 200;
-      drawLedgerBar(b.svg, b.line, b.max, w);
+      drawLedgerBar(b.svg, b.line, b.max, w, b.index);
     });
   }
 
@@ -1288,29 +2442,27 @@
       "H" + x + "Z";
   }
 
-  function drawLedgerBar(svg, line, max, width) {
+  function drawLedgerBar(svg, line, max, width, index) {
     clear(svg);
     var H = 18, GAP = 2;
-    var total = line.total || 0;
-    var barW = Math.max(0, (total / (max || 1)) * Math.max(0, width - 2));
-    var comps = line.components || {};
-    var vals = LEDGER_COMPONENTS.map(function (c) { return Math.max(0, comps[c[0]] || 0); });
-    var vsum = vals.reduce(function (a, b) { return a + b; }, 0);
+    var parts = ledgerParts(line);
+    var span = Math.max(0, width - 2);
+    var grossW = Math.max(0, (parts.gross / (max || 1)) * span);
 
     /* Track: one hairline so an empty bar is still legible. */
-    svg.appendChild(sv("rect", { x: 0, y: H / 2 - 0.5, width: Math.max(0, width - 2), height: 1, fill: "currentColor", opacity: 0.08 }));
+    svg.appendChild(sv("rect", { x: 0, y: H / 2 - 0.5, width: span, height: 1, fill: "currentColor", opacity: 0.08 }));
 
-    if (!vsum || barW <= 0) {
+    if (!parts.gross || grossW <= 0) {
       svg.appendChild(sv("rect", { x: 0, y: 4, width: 2, height: H - 8, rx: 1, fill: "currentColor", opacity: 0.25 }));
       return;
     }
-    var nonEmpty = vals.filter(function (v) { return v > 0; }).length;
-    var usable = Math.max(1, barW - GAP * Math.max(0, nonEmpty - 1));
+    var nonEmpty = parts.pos.filter(function (v) { return v > 0; }).length;
+    var usable = Math.max(1, grossW - GAP * Math.max(0, nonEmpty - 1));
     var x = 0, drawn = 0;
-    vals.forEach(function (v, i) {
+    parts.pos.forEach(function (v, i) {
       if (v <= 0) return;
       drawn++;
-      var w = usable * (v / vsum);
+      var w = usable * (v / parts.gross);
       var isLast = drawn === nonEmpty;
       var p = sv("path", { d: roundPath(x, 0, w, H, isLast ? 4 : 0, isLast ? 4 : 0) });
       p.setAttribute("class", "lfill lfill--" + (i + 1));
@@ -1320,6 +2472,47 @@
       svg.appendChild(p);
       x += w + GAP;
     });
+
+    if (parts.penalty > 0) drawLedgerPenalty(svg, parts, grossW, H, index);
+  }
+
+  /* The deduction. Drawn as the struck-through tail of the same bar: the solid
+     part ends where the agent actually stands, the hatched tail is what was
+     taken back, and a rule marks the boundary. It is deliberately impossible to
+     mistake for a seventh component — it has no hue of its own, only texture in
+     the reserved critical colour. */
+  function drawLedgerPenalty(svg, parts, grossW, H, index) {
+    var netW = Math.max(0, grossW * (parts.net / parts.gross));
+    var patId = "lpen-" + (index || 0);
+
+    var defs = sv("defs");
+    var pat = sv("pattern", {
+      id: patId, width: 6, height: 6,
+      patternUnits: "userSpaceOnUse", patternTransform: "rotate(135)"
+    });
+    var ln = sv("line", { x1: 0, y1: 0, x2: 0, y2: 6 });
+    ln.setAttribute("class", "lpen-line");
+    pat.appendChild(ln);
+    defs.appendChild(pat);
+    svg.appendChild(defs);
+
+    var wash = sv("rect", { x: netW, y: 0, width: Math.max(0, grossW - netW), height: H, rx: 2 });
+    wash.setAttribute("class", "lpen-wash");
+    svg.appendChild(wash);
+
+    var hatch = sv("rect", { x: netW, y: 0, width: Math.max(0, grossW - netW), height: H, rx: 2 });
+    hatch.setAttribute("fill", "url(#" + patId + ")");
+    svg.appendChild(hatch);
+
+    var edge = sv("line", { x1: netW, y1: 0, x2: netW, y2: H });
+    edge.setAttribute("class", "lpen-edge");
+    svg.appendChild(edge);
+
+    var ttl = sv("title", {});
+    ttl.textContent = "Deducted: " + fmtNum(parts.penalty, 2) +
+      " pts for requests accepted and never answered. " +
+      fmtNum(parts.gross, 2) + " earned, " + fmtNum(parts.net, 2) + " net.";
+    hatch.appendChild(ttl);
   }
 
   /* ================================================== 14. collaboration graph
@@ -1386,10 +2579,12 @@
     marker.appendChild(ap);
     defs.appendChild(marker);
 
-    var maxW = 1, deg = {};
+    var maxW = 1, maxDel = 0, deg = {};
     edges.forEach(function (e) {
       var w = isFinite(e.weight) ? e.weight : 1;
       if (w > maxW) maxW = w;
+      var d = (e.kinds && e.kinds.delegation) || 0;
+      if (d > maxDel) maxDel = d;
       deg[e.source] = (deg[e.source] || 0) + w;
       deg[e.target] = (deg[e.target] || 0) + w;
     });
@@ -1432,6 +2627,21 @@
         path.setAttribute("opacity", "0.72");
       }
       edgeLayer.appendChild(path);
+
+      /* Delegation rides inside the chord instead of replacing it. The chord is
+         how much these two work together; the filament is how much of that was
+         one of them doing work the other asked for. Same settled layout, one
+         more fact — and it is also in the table below, so it is never only a
+         hairline you have to notice. */
+      var del = kinds.delegation || 0;
+      if (del > 0) {
+        var fw = 1 + 2.6 * Math.sqrt(del / (maxDel || 1));
+        var fil = sv("path", { d: d, "stroke-width": Math.min(fw, Math.max(1, sw - 0.8)).toFixed(2) });
+        fil.setAttribute("class", "gfil");
+        edgeLayer.appendChild(fil);
+        (edgesByNode[e.source] = edgesByNode[e.source] || []).push(fil);
+        (edgesByNode[e.target] = edgesByNode[e.target] || []).push(fil);
+      }
 
       var hit = sv("path", { d: d, "stroke-width": Math.max(14, sw + 10), stroke: "transparent", fill: "none" });
       hit.setAttribute("class", "ghit");
@@ -1502,6 +2712,7 @@
     if (k.reply) out.push(k.reply + " replies");
     if (k.citation) out.push(k.citation + " citations");
     if (k.co_edit) out.push(k.co_edit + " co-edits");
+    if (k.delegation) out.push(k.delegation + " delegated");
     if (k.blocked_on) out.push(k.blocked_on + " blocked-on");
     return out.join(", ") || "—";
   }
@@ -1514,6 +2725,7 @@
         ["replies", String(k.reply || 0)],
         ["citations", String(k.citation || 0)],
         ["co-edited files", String(k.co_edit || 0)],
+        ["delegated requests", String(k.delegation || 0)],
         ["blocked on", String(k.blocked_on || 0)]
       ]
     };
@@ -2201,6 +3413,7 @@
     btn.setAttribute("title", "Theme: " + themeLabels[m].toLowerCase());
     readThemeTokens();
     mark("roster"); mark("ledger"); mark("graph"); mark("timeline"); mark("tasks"); mark("files");
+    mark("caps"); mark("reqs");
     chatReset();
   }
 
@@ -2248,6 +3461,11 @@
     $("togAnnounce").addEventListener("change", function (e) {
       announceChat = e.target.checked;
       chatLog.setAttribute("aria-live", announceChat ? "polite" : "off");
+    });
+
+    $("reqsMoreBtn").addEventListener("click", function () {
+      reqHistAll = !reqHistAll;
+      mark("reqs");
     });
 
     Array.prototype.forEach.call($("tlRange").querySelectorAll(".seg__btn"), function (b) {
@@ -2306,6 +3524,12 @@
     });
     if (needRoster || tickN % 15 === 0) mark("roster");
     if (tickN % 5 === 0) mark("timeline");
+    /* The expiry clocks are the whole point of the requests panel, so they move
+       every second — but in place, writing into a handful of remembered nodes
+       rather than re-rendering a panel full of expanded reasons. The settled
+       list's "4m ago" column is coarse, so it rides the 30 s rebuild instead. */
+    paintReqClocks();
+    if (tickN % 30 === 0 && S.reqs.size) mark("reqs");
   }
 
   function loadFixture() {

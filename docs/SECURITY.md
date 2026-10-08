@@ -282,7 +282,7 @@ Someone holds `agent_key_hex` for `agt_…`. What can they do?
   signature, so a tampered past event fails verification for everyone.
 * Learn the watchword.
 
-**Response:** `parley revoke <agent_id>`. The key dies immediately, an
+**Response:** `parley revoke --agent <agent_id>`. The key dies immediately, an
 `agent.revoked` event lands in the log, and nothing else is disturbed. You do
 *not* need to rotate the watchword or re-key anyone else — that is §3 paying off.
 Then read the log: every action the key took is in it, signed, with a sequence

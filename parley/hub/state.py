@@ -17,6 +17,12 @@ Lock order inside this module (see ``server.py`` for the Hub-wide order):
 
 ``_lock`` is never held while calling into the Store for the ledger read, and
 never held while calling ``parley.ledger.compute``.
+
+The Exchange (SPEC §15) adds no lock of its own.  The :class:`parley.exchange`
+``Registry`` and ``RequestTracker`` are deliberately not thread-safe by
+themselves; they live behind ``self._lock`` like everything else here, which is
+what lets ``snapshot()`` take the registry and the request table at the same
+instant instead of two instants a reader would have to reconcile.
 """
 
 from __future__ import annotations
@@ -25,9 +31,13 @@ import logging
 import threading
 import time
 from collections import Counter, OrderedDict, deque
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import (
+    Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple,
+)
 
 from .. import ledger as ledger_mod
+from ..client.exchange import build_registry
+from ..exchange import Registry, RequestTracker
 from ..jsonutil import now_rfc3339, parse_rfc3339
 from ..version import WIRE_VERSION
 from .store import Store
@@ -51,6 +61,26 @@ LEDGER_MAX_EVENTS = 200_000
 #: The Ledger is recomputed at most this often, however many events arrive.
 LEDGER_MIN_INTERVAL_S = 2.0
 
+#: The event types ``parley.client.exchange.build_registry`` folds.  ``rebuild``
+#: collects exactly these while it pages through the log so it can hand the whole
+#: (small) set to ``build_registry`` without holding the rest of the log resident
+#: -- and so ``agent.heartbeat``, which shares the ``agent.`` prefix and arrives
+#: every 15 s per agent, is never collected.
+REGISTRY_EVENT_TYPES = (
+    "agent.hello", "agent.offline", "agent.bye", "agent.revoked",
+    "capability.announce", "capability.revoke",
+)
+
+#: Request fields a viewer token does not get (SPEC §3.7).  A viewer reads the
+#: roster, the PSR, tasks, the Ledger and the file *index* -- metadata -- and gets
+#: no file *content*; the payload of a delegated request is content by the same
+#: measure.  Everything else about a request (who asked whom, for which
+#: capability, why, how long ago, what state it is in) stays visible, because
+#: that is precisely the Deck's §8.1 "Requests in flight" panel.
+VIEWER_REDACTED_REQUEST_FIELDS = (
+    "input", "instruction", "result", "output_text", "files",
+)
+
 
 def color_hue(agent_id: str) -> int:
     """SPEC §8.3 -- deterministic per-agent hue so every Deck agrees."""
@@ -69,6 +99,33 @@ def _as_float_ts(value: Any, fallback: float) -> float:
         except (ValueError, TypeError):
             return fallback
     return fallback
+
+
+def _redact_request(record: dict) -> dict:
+    """One request record as a viewer token may see it (SPEC §3.7, §15.3).
+
+    Metadata stays, payload goes.  A viewer is the Deck: it needs to show that
+    Ada asked Bob for ``kvm.relay`` four minutes ago, why she says she needs it,
+    and whether he has accepted -- and it has no more business reading the
+    arguments she passed or the answer he gave than it has reading the bytes of a
+    synced file, which §3.7 already withholds.  ``error`` keeps its ``code`` so a
+    failure is still legible as a failure; its message and hint do not survive,
+    because that is where a provider's internals end up.
+    """
+    out = {k: v for k, v in record.items() if k not in VIEWER_REDACTED_REQUEST_FIELDS}
+    out["input"] = {}
+    out["instruction"] = None
+    out["result"] = None
+    out["output_text"] = ""
+    out["files"] = []
+    error = record.get("error")
+    if isinstance(error, dict):
+        out["error"] = {"code": str(error.get("code") or "")}
+    # Explicit rather than implied: the Deck must be able to tell "no output"
+    # from "output it is not being shown", and a human must be able to tell why
+    # a field is empty.
+    out["redacted"] = True
+    return out
 
 
 class StateView:
@@ -106,6 +163,15 @@ class StateView:
         self._heat: Dict[str, float] = {}
         self._notices: Deque[dict] = deque(maxlen=NOTICE_WINDOW)
         self._decisions: "OrderedDict[str, dict]" = OrderedDict()
+
+        #: SPEC §15.  The merged capability catalogue and the request state
+        #: machine, both folded from the log and both guarded by ``self._lock``.
+        self._registry = Registry()
+        self._requests = RequestTracker()
+        #: True only while :meth:`rebuild` is paging the log: the registry is
+        #: rebuilt in one go from ``build_registry`` at the end of that pass, so
+        #: the per-event path must not also fold it.
+        self._replaying = False
 
         self._edges: Dict[Tuple[str, str], Dict[str, int]] = {}
         self._event_author: "OrderedDict[str, str]" = OrderedDict()
@@ -169,6 +235,12 @@ class StateView:
                     self._online[actor] = True
                 self._joined.setdefault(actor, str(event.get("ts") or now_rfc3339()))
 
+            # SPEC §15.1: an agent going offline implicitly revokes everything it
+            # announced.  Done before the branch below so the drop happens exactly
+            # where `build_registry` does it, for the same three types.
+            if etype in ("agent.offline", "agent.bye", "agent.revoked") and not self._replaying:
+                self._registry.drop_agent(str(body.get("agent_id") or actor))
+
             if etype == "agent.hello":
                 self._hello[actor] = dict(body)
                 self._online[actor] = True
@@ -222,6 +294,20 @@ class StateView:
                     held = self._locks.get(str(p))
                     if held and held.get("agent_id") == actor:
                         self._locks.pop(str(p), None)
+            elif etype == "capability.announce":
+                if not self._replaying:
+                    caps = body.get("capabilities")
+                    self._registry.announce(
+                        actor,
+                        str(self._hello.get(actor, {}).get("name") or ""),
+                        caps if isinstance(caps, list) else [],
+                    )
+            elif etype == "capability.revoke":
+                if not self._replaying:
+                    names = body.get("names")
+                    self._registry.revoke(actor, names if isinstance(names, list) else [])
+            elif etype.startswith("request."):
+                self._apply_request(actor, etype, body, event, seq, when)
             elif etype.startswith("task."):
                 self._apply_task(actor, etype, body, event)
             elif etype.startswith("decision."):
@@ -364,6 +450,34 @@ class StateView:
     def _release_locks_of(self, agent_id: str) -> None:
         for p in [p for p, l in self._locks.items() if l.get("agent_id") == agent_id]:
             self._locks.pop(p, None)
+
+    def _apply_request(
+        self, actor: str, etype: str, body: dict, event: dict, seq: int, when: float
+    ) -> None:
+        """Fold one ``request.*`` event (SPEC §15.3) and draw its delegation edge.
+
+        The tracker is the state machine; everything the Hub decides about a
+        request -- who owes whom an answer, what has expired -- comes from it and
+        not from a second copy of the rules living here.
+        """
+        self._requests.apply(event, now=when)
+        if etype == "request.create":
+            to = str(body.get("to") or "")
+            # A `to: "any"` offer has no counterpart yet; its edge is drawn when
+            # somebody accepts, so the graph shows delegation that happened
+            # rather than delegation that was merely offered.
+            if to and to != "any":
+                self._edge(actor, to, "delegation")
+        elif etype == "request.accept":
+            req_id = body.get("id")
+            record = self._requests.get(req_id) if isinstance(req_id, str) else None
+            if (
+                record is not None
+                and record.get("to") == "any"
+                and record.get("accepted_by") == actor
+                and record.get("accept_seq") == seq
+            ):
+                self._edge(str(record.get("from") or ""), actor, "delegation")
 
     def _apply_task(self, actor: str, etype: str, body: dict, event: dict) -> None:
         tid = str(body.get("id") or "")
@@ -512,6 +626,26 @@ class StateView:
                     out[p] = held["agent_id"]
         return out
 
+    def due_expiries(self, now: float) -> List[dict]:
+        """Partial ``request.expired`` events the Hub owes (SPEC §15.3).
+
+        The records are *not* moved here: the Hub signs and appends each one, and
+        the transition happens when that event comes back through :meth:`apply`.
+        One code path for the transition, whether it came from this tick or from
+        a replay of the log.
+        """
+        with self._lock:
+            return self._requests.expire_due(now)
+
+    def due_taken(self) -> List[dict]:
+        """Partial ``request.taken`` events owed to the losers of a ``to: "any"`` race."""
+        with self._lock:
+            return self._requests.drain_taken()
+
+    def request_state(self, req_id: str) -> str:
+        with self._lock:
+            return self._requests.state_of(req_id)
+
     def due_decisions(self, now: float) -> List[Tuple[str, str, Dict[str, int]]]:
         """Decisions whose quorum is met or whose deadline has passed."""
         active = max(1, self.active_agent_count())
@@ -582,19 +716,34 @@ class StateView:
             self._file_authors.clear()
             self._coedit_seen.clear()
             self._prev_blocked.clear()
+            self._registry = Registry()
+            self._requests = RequestTracker()
+            self._replaying = True
             self._ledger_cache = None
             self._ledger_dirty = True
 
         since = 0
         total = 0
-        while True:
-            batch = self.store.read(since=since, limit=2000)
-            if not batch:
-                break
-            for ev in batch:
-                self._apply_locked_entry(ev)
-            since = int(batch[-1].get("seq") or since)
-            total += len(batch)
+        registry_log: List[dict] = []
+        try:
+            while True:
+                batch = self.store.read(since=since, limit=2000)
+                if not batch:
+                    break
+                for ev in batch:
+                    if ev.get("type") in REGISTRY_EVENT_TYPES:
+                        registry_log.append(ev)
+                    self._apply_locked_entry(ev)
+                since = int(batch[-1].get("seq") or since)
+                total += len(batch)
+        finally:
+            # SPEC §15.2: the registry is a fold of `capability.*` over the log,
+            # so a rebuild takes the one shared implementation of that fold rather
+            # than a second, subtly different copy of it.  The request tracker is
+            # the fresh one installed above, folded event by event on the way past.
+            with self._lock:
+                self._replaying = False
+                self._registry = build_registry(registry_log)
         head = self.store.head_seq()
         with self._lock:
             self._head_seq = max(self._head_seq, head)
@@ -646,6 +795,7 @@ class StateView:
                 for l in sorted(self._locks.values(), key=lambda x: x["path"])
                 if l.get("expires", 0.0) > now
             ]
+            requests = self._requests_locked(for_viewer=for_viewer)
             snap = {
                 "v": WIRE_VERSION,
                 "session": self.identity.get("session", ""),
@@ -670,6 +820,8 @@ class StateView:
                 },
                 "ledger": self._ledger_cache or {"lines": [], "weights": dict(self.weights),
                                                  "computed_at": now_rfc3339(), "event_count": 0},
+                "capabilities": self._capabilities_locked(agents),
+                "requests": requests,
                 "graph": self._graph(agents),
                 "decisions": [self._decision_entry(d) for d in self._decisions.values()],
                 "notices": list(self._notices),
@@ -753,6 +905,114 @@ class StateView:
             "option": dec.get("option"),
         }
 
+    # -------------------------------------------------------------- exchange
+
+    def capabilities(self) -> dict:
+        """``GET /v1/capabilities`` (SPEC §15.2): the merged registry.
+
+        Identical for an agent and for a viewer.  A capability catalogue is a
+        published advertisement -- it exists to be read by somebody deciding
+        whether to ask -- so there is nothing in it to hold back from the Deck.
+        """
+        now = time.time()
+        agents_rows = self.store.list_agents()
+        with self._lock:
+            # Only `agent_id` and `online` are used; the viewer form is the one
+            # with nothing extra in it.
+            agents = [self._agent_entry(rec, now, True) for rec in agents_rows]
+            return self._capabilities_locked(agents)
+
+    def requests(
+        self,
+        *,
+        state: "Optional[Sequence[str]]" = None,
+        to: str = "",
+        from_agent: str = "",
+        for_viewer: bool = False,
+    ) -> dict:
+        """``GET /v1/requests`` (SPEC §15.3), with the three documented filters.
+
+        ``to`` matches the addressee *and* whoever accepted a ``to: "any"``
+        offer, because from the caller's point of view that agent is who the
+        request went to.
+        """
+        with self._lock:
+            return self._requests_locked(
+                for_viewer=for_viewer, state=state, to=to, from_agent=from_agent
+            )
+
+    def _capabilities_locked(self, agents: List[dict]) -> dict:
+        online: Dict[str, bool] = {a["agent_id"]: bool(a["online"]) for a in agents}
+        for aid, flag in self._online.items():
+            online.setdefault(aid, bool(flag))
+        return self._registry.to_dict(
+            online=online,
+            in_flight=self._in_flight_by_capability(),
+        )
+
+    def _in_flight_by_capability(self) -> Dict[str, int]:
+        """``{"<agent>/<capability>": n}`` for work a provider has *accepted*.
+
+        Keyed per capability only, never per agent: ``Registry.to_dict`` falls
+        back from ``"<agent>/<name>"`` to ``"<agent>"``, so a bare per-agent entry
+        would make every *other* capability that agent holds report the agent's
+        whole load as its own.  A pending request is not counted -- the provider
+        has not agreed to it, and SPEC §15.1 ``concurrency`` bounds accepted work.
+        """
+        counts: Dict[str, int] = {}
+        for record in self._requests.to_dict()["in_flight"]:
+            if record.get("state") != "accepted":
+                continue
+            name = record.get("capability")
+            if not name:
+                continue  # a free-form instruction belongs to no capability row
+            provider = str(record.get("accepted_by") or record.get("to") or "")
+            if not provider or provider == "any":
+                continue
+            key = provider + "/" + str(name)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _requests_locked(
+        self,
+        *,
+        for_viewer: bool,
+        state: "Optional[Sequence[str]]" = None,
+        to: str = "",
+        from_agent: str = "",
+    ) -> dict:
+        data = self._requests.to_dict()
+        wanted = tuple(state or ())
+
+        def keep(record: dict) -> bool:
+            if wanted and record.get("state") not in wanted:
+                return False
+            if to and to not in (record.get("to"), record.get("accepted_by")):
+                return False
+            if from_agent and record.get("from") != from_agent:
+                return False
+            return True
+
+        return {
+            "in_flight": self._request_rows(data["in_flight"], keep, for_viewer),
+            "recent": self._request_rows(data["recent"], keep, for_viewer),
+            # The tally is always of the whole session, filtered or not: it is the
+            # Deck's summary line, and a count that moved with the filter would be
+            # read as "this is all there is".
+            "counts": dict(data["counts"]),
+        }
+
+    @staticmethod
+    def _request_rows(
+        rows: Iterable[dict], keep: "Callable[[dict], bool]", for_viewer: bool
+    ) -> List[dict]:
+        out: List[dict] = []
+        for record in rows:
+            if not keep(record):
+                continue
+            out.append(_redact_request(record) if for_viewer else record)
+        return out
+
     def _graph(self, agents: List[dict]) -> dict:
         nodes = [{"id": a["agent_id"], "label": a["name"]} for a in agents]
         known = {n["id"] for n in nodes}
@@ -770,6 +1030,7 @@ class StateView:
                         "citation": int(kinds.get("citation", 0)),
                         "co_edit": int(kinds.get("co_edit", 0)),
                         "blocked_on": int(kinds.get("blocked_on", 0)),
+                        "delegation": int(kinds.get("delegation", 0)),
                     },
                 }
             )

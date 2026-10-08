@@ -775,7 +775,11 @@ parley know     "title" --kind KIND [--detail TEXT] [--ref PATH]...
 parley task     create|claim|update|done|list …
 parley offer    --name N --title T --kind K [--schema FILE] [--safety S] [--desc TEXT]
 parley offer    --from FILE                          # announce a whole catalogue at once
-parley revoke   --name N
+parley revoke   --name N                            # withdraw a capability you announced (§15.1)
+parley revoke   --agent AGENT_ID                    # evict a participant (§3.8, host token)
+                # Two revocations, one verb, deliberately not interchangeable. --agent is the
+                # incident response to a leaked agent key; rotating the watchword does NOT
+                # evict anyone, because agent keys do not derive from it.
 parley capabilities [--kind K] [--agent A]           # who can do what for me
 parley ask      AGENT CAPABILITY [--input JSON] [--reason TEXT] [--wait] [--timeout S]
 parley instruct AGENT "natural language task" --reason TEXT [--wait]

@@ -13,9 +13,10 @@ Status: **v1 — expect sharp edges.** See [Limitations](#limitations) before yo
 ## Why it exists
 
 Multi-agent setups usually fail at the boring parts: two agents editing the same file, nobody
-knowing what anybody else is doing, and no shared record of why a decision was made. Parley is
-infrastructure for those three problems — synchronised state, a standing report, and an
-append-only log where every decision is attributable. It deliberately solves nothing else.
+knowing what anybody else is doing, no shared record of why a decision was made, and no way for an
+agent to use the thing only the agent next to it can reach. Parley is infrastructure for those four
+problems — synchronised state, a standing report, an append-only log where every decision is
+attributable, and the Exchange. It deliberately solves nothing else.
 
 ---
 
@@ -141,6 +142,7 @@ The page survives the Hub restarting without a manual refresh, and degrades to l
 | **Standing reports (PSR)** | A published standard for "what am I doing": state, headline, detail, focus paths, task, progress, what you are blocked on. With a freshness contract the Deck enforces socially. |
 | **Advisory locks** | Cooperative, never a filesystem mutex. The Hub still accepts writes to a locked path but flags them `lock_violation`. |
 | **Tasks and decisions** | A task board, plus lightweight proposals with votes, a quorum and a deadline, so agents can divide work without a human referee. |
+| **The Exchange** | Agents lend each other what they alone can reach — a skill, an MCP server, attached hardware, a credential, a GPU — through announced capabilities and a delegated-request lifecycle with per-agent consent. See below. |
 | **The Ledger** | Explainable contribution scoring: fixed published weights, every point traceable to an event, `parley ledger --why <agent>` prints the breakdown. |
 | **Pigeonhole mode** | Full participation by appending JSON lines to a file. An agent that can only read and write files is still first-class. |
 | **Two-tier keys** | The watchword derives an *enrolment* key only; the Hub mints a per-agent key at join. Rotating the watchword therefore does not kick anybody out. |
@@ -149,6 +151,47 @@ The page survives the Hub restarting without a manual refresh, and degrades to l
 | **LAN discovery** | The Hub answers a UDP broadcast probe, so joining needs no IP address typed by a human. |
 | **`parley doctor`** | Seventeen checks from Python version to SSE to blob round-trip to "you are bound to 0.0.0.0 on a public interface without TLS". |
 | **Stdlib only** | Python 3.9+, no dependencies. Optional crypto accelerators are used if already installed, never required. |
+
+---
+
+## The Exchange: agents are not interchangeable
+
+One agent holds the MCP server onto the private database. One is the machine physically wired to
+the bench. One has the GPU. One has a credential the others cannot get, or a packaged skill, or a
+person sitting at it who will go and photograph something.
+
+Without a way to say so, each of those is invisible: the agent writing the report does not know
+that the agent next to it can read the drive, so it guesses, or it stops. The Exchange is the part
+of the protocol that fixes that.
+
+**Announce what you can do:**
+
+```sh
+parley offer --name kvm.relay --title "Switch a physical relay on the bench KVM" \
+  --kind hardware --safety dangerous --schema ./kvm-relay.schema.json \
+  --desc "Closes, opens or pulses one of 10 dry contacts wired to the bench at desk 4. Relay 3 is the DUT mains contactor, so pulsing it power-cycles whatever is on the bench. There is no undo."
+```
+
+**Find out who can help, and ask:**
+
+```sh
+parley capabilities --kind hardware
+parley ask agt_0c5518aa91be7742 kvm.relay --input '{"relay":3,"action":"pulse"}' \
+  --reason "The drive reports F06 under load; I need to know whether it survives a power cycle." --wait
+```
+
+The receiving agent decides. A request is a **proposal, not a command**: every participant
+evaluates it against its own local policy, and nothing in the protocol obliges anyone to obey.
+Capabilities declare a safety level that drives consent — `safe` may be auto-accepted, `guarded`
+needs a policy that names the caller, and `dangerous` (anything that moves an actuator, spends
+money, writes outside the workspace, touches production, or cannot be undone) requires a human
+approval on every single call, regardless of policy. A provider may always decline, and must
+decline rather than ignore.
+
+Everything is on the one append-only log: who asked, why they said they were asking, who consented,
+what came back. "Why did the drive power-cycle at 14:07?" is a question with an answer.
+
+Full detail: [`docs/EXCHANGE.md`](docs/EXCHANGE.md). Normative: [`docs/SPEC.md`](docs/SPEC.md) §15.
 
 ---
 
@@ -182,6 +225,21 @@ Read this part.
 - **No end-to-end identity.** Anyone holding the watchword can enrol as anyone. Per-agent keys are
   minted by the Hub, so the Hub can impersonate any agent. Use `--approve` and the verbal
   fingerprint when that matters. Full discussion in [`docs/SECURITY.md`](docs/SECURITY.md).
+- **Exchange consent is per-agent local policy, and that is all it is.** Each provider enforces its
+  own `.parley/policy.json`; there is no central authorisation server and no way for the Hub or
+  another agent to vouch for a caller. A compromised agent key is a compromised agent — its
+  requests are correctly signed and indistinguishable from legitimate ones. The protections that
+  remain are the hard floor on `dangerous` work (a human approves every call, and no policy file
+  can remove that), the fact that every request and consent decision is in the log under a name,
+  and the provider's unconditional right to decline. If an agent lends something that must not be
+  misused, the human approval is the control — not the signature.
+- **A capability's declared safety is self-reported.** Nothing verifies that an agent calling
+  something `safe` is telling the truth. Misdeclaring it is the worst failure available in the
+  Exchange, and the mitigation is social and auditable rather than technical.
+- **The Ledger's service component measures volume of work done for others, not its value.** Three
+  points per fulfilled request, capped per requester-pair; a one-line lookup and an afternoon on
+  the bench score the same. Like the rest of the Ledger it counts events, and treating it as a
+  measure of usefulness would be a mistake.
 
 ---
 
@@ -210,6 +268,7 @@ in any log line, event body or error message. Threat model:
 | [`docs/QUICKSTART.md`](docs/QUICKSTART.md) | Humans, in sixty seconds. |
 | [`docs/SPEC.md`](docs/SPEC.md) | The normative `PARLEY/1` contract. Authoritative. |
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | The protocol taught, with annotated wire traces and real signing vectors. For third-party implementations. |
+| [`docs/EXCHANGE.md`](docs/EXCHANGE.md) | Capability lending and delegated work: announcing, consent policy, the request lifecycle, and the prompt-injection threat it introduces. |
 | [`docs/INTERNAL-API.md`](docs/INTERNAL-API.md) | Python module names and signatures. |
 | [`docs/STANDING-REPORT.md`](docs/STANDING-REPORT.md) | The PSR standard, adoptable on its own. |
 | [`docs/LEDGER.md`](docs/LEDGER.md) | How scoring works, and what it refuses to measure. |
@@ -244,10 +303,20 @@ tests/                 incl. test_conformance.py, runnable against any implement
 
 ## Conformance
 
-An implementation is `PARLEY/1` conformant if it authenticates per SPEC §3.3, produces and
-consumes the events of §4 with §2 validation, emits a conforming PSR at the §6 freshness contract,
-follows §7.6 for conflicts, and preserves unknown fields and `x.*` event types. The Deck and the
-Ledger are **not** required — a headless participant is a valid participant.
+Two profiles (SPEC §14).
+
+**Base.** An implementation is `PARLEY/1` **Base** conformant if it authenticates per SPEC §3.3,
+produces and consumes the events of §4 with §2 validation, emits a conforming PSR at the §6
+freshness contract, follows §7.6 for conflicts, and preserves unknown fields and `x.*` event types.
+
+**Exchange.** Additionally **Exchange** conformant if it implements §15: announces its capabilities
+honestly, honours the request lifecycle including `request.decline`, enforces a consent policy
+before executing delegated work, and never silently drops a request it has accepted.
+
+A participant with nothing to lend is still Base conformant — but it must still consume
+`capability.*` and `request.*` without error, and must **decline** a request addressed to it rather
+than ignore it. The Deck and the Ledger are **not** required for either profile; a headless
+participant is a valid participant.
 
 `tests/test_conformance.py` can be pointed at any Hub implementation and is the acceptance test
 for an independent one. [`docs/PROTOCOL.md`](docs/PROTOCOL.md) is written for exactly that.

@@ -3,11 +3,12 @@
 
 This is a *reference*, not pseudocode. Run it and it joins a real parley, keeps a
 conforming standing report, reads the chat, claims a task, takes a lock, edits a
-synced file and records a knowledge contribution -- then leaves cleanly.
+synced file, records a knowledge contribution, lends a capability to the other
+agents and asks one of them for help -- then leaves cleanly.
 
 Read it top to bottom: it is laid out in the order AGENTS.md describes, and every
-obligation from AGENTS.md section 6 is implemented and labelled with the O-number
-it satisfies.
+obligation from AGENTS.md sections 6 and 6A is implemented and labelled with the
+O-number it satisfies.
 
 Usage
 -----
@@ -25,6 +26,9 @@ Usage
     # Just watch, change nothing:
     python3 agent.py --workspace ~/work/parley-ws --observe
 
+    # Take part in chat and files but lend nothing and ask nobody:
+    python3 agent.py --workspace ~/work/parley-ws --no-exchange
+
 Where the LLM goes
 ------------------
 There is no model in here. `decide_next_action()` is the seam: it is a plain
@@ -32,6 +36,24 @@ function that looks at the session state and returns what to do next. Replace it
 body with a call to your model, keep the surrounding machinery, and you have a
 conforming LLM agent. Everything else in this file is the part you would otherwise
 have to write yourself.
+
+The Exchange
+------------
+This agent is an Exchange participant (AGENTS.md section 6A, SPEC section 15). It:
+
+* announces one capability, `workspace.grep` -- read-only, declared `safe`, with an
+  input schema (O11, O13);
+* serves requests for it from a handler, under a consent policy it did not write
+  (O14, O15);
+* reads the registry before deciding it cannot do something (O12), and asks a peer
+  for `workspace.grep` over *that* agent's copy of the workspace, which is a real
+  cross-check that file sync agrees on both ends -- with a stated reason (O16).
+
+Two instances of this file, in two workspaces on the same parley, will discover each
+other and exchange. Run it with `--no-exchange` to stay a Base-profile participant:
+even then it still *consumes* capability.* and request.* events and declines
+anything addressed to it rather than ignoring it, which SPEC section 14 requires of
+every participant.
 
 Requires: Python 3.9+, and the `parley` package importable. No other dependencies.
 """
@@ -51,8 +73,10 @@ from typing import Any, Deque, Dict, List, Optional
 
 try:
     from parley.client.client import ParleyClient
+    from parley.client.exchange import Provider, Requester
     from parley.client.sync import WorkspaceSync
     from parley.config import Credentials
+    from parley.exchange import Capability, Decision, Policy
     from parley.ids import new_task_id
 except ImportError as exc:  # pragma: no cover - a setup problem, not a runtime one
     sys.stderr.write(
@@ -74,6 +98,15 @@ HEARTBEAT_INTERVAL_S = 15.0  # policy.heartbeat_s
 SYNC_INTERVAL_S = 2.0        # policy.poll_ms
 THINK_INTERVAL_S = 10.0      # how often this agent reconsiders what to do
 CHAT_HISTORY = 200           # how much chat we keep in memory
+PUMP_INTERVAL_S = 2.0        # Exchange watchdog tick; see Provider.pump()
+
+# Bounds for the capability we lend. A provider decides what it is willing to
+# spend on a stranger's request; these are that decision, written down.
+GREP_MAX_FILE_BYTES = 1 * 1024 * 1024
+GREP_MAX_FILES = 2000
+GREP_DEFAULT_HITS = 20
+GREP_SKIP_DIRS = {".parley", ".git", "__pycache__", "node_modules", ".venv",
+                  "venv", ".tox", "dist", "build", ".mypy_cache"}
 
 
 # --------------------------------------------------------------------------- #
@@ -96,6 +129,12 @@ class Session:
         self.tasks: Dict[str, dict] = {}        # task id -> {title, status, claimed_by}
         self.conflicts: List[dict] = []
         self.notices: List[str] = []
+        # The Exchange registry, folded out of capability.* events: agent -> name
+        # -> capability dict. `Requester.discover()` reads the same thing from
+        # /v1/capabilities in one call; we fold it from the stream as well so this
+        # file demonstrates where the data actually comes from, and so it keeps
+        # working against a Hub that only publishes the snapshot.
+        self.capabilities: Dict[str, Dict[str, dict]] = {}
 
     # -- writes, from the stream thread ------------------------------------- #
 
@@ -123,10 +162,31 @@ class Session:
                 if gone:
                     self.agents.pop(gone, None)
                     self.psr.pop(gone, None)
+                    # An agent going offline implicitly revokes everything it
+                    # announced (SPEC 15.1). Keeping a dead agent's capabilities
+                    # in the registry is how you end up asking a machine that is
+                    # not there.
+                    self.capabilities.pop(gone, None)
                     # Their locks are stale now; drop them so we do not avoid
                     # files nobody is holding.
                     for path in [p for p, h in self.locks.items() if h.get("agent_id") == gone]:
                         self.locks.pop(path, None)
+
+            elif etype == "capability.announce":
+                # SPEC 15.1: announce is TOTAL, not incremental. Replace the whole
+                # catalogue for this agent; never merge. That is what makes
+                # re-announcing on reconnect correct, and what makes a capability
+                # that quietly went away stop being offered.
+                table: Dict[str, dict] = {}
+                for cap in body.get("capabilities") or []:
+                    if isinstance(cap, dict) and isinstance(cap.get("name"), str):
+                        table[cap["name"]] = cap
+                self.capabilities[actor] = table
+
+            elif etype == "capability.revoke":
+                table = self.capabilities.get(actor) or {}
+                for name in body.get("names") or []:
+                    table.pop(name, None)
 
             elif etype == "lock.acquire":
                 for path in body.get("paths") or []:
@@ -200,7 +260,16 @@ class Session:
                           if h.get("expires", 0) > now},
                 "tasks": {k: dict(v) for k, v in self.tasks.items()},
                 "conflicts": list(self.conflicts),
+                "capabilities": {a: dict(t) for a, t in self.capabilities.items()},
             }
+
+    def who_offers(self, name: str, *, exclude_self: bool = True) -> List[str]:
+        """O12: which agents have announced `name`. Empty means nobody can."""
+        with self.lock:
+            return sorted(
+                agent_id for agent_id, table in self.capabilities.items()
+                if name in table and not (exclude_self and agent_id == self.me)
+            )
 
     def path_held_by_other(self, path: str) -> Optional[dict]:
         """Obligation O8: who, if anyone, holds this path -- other than me."""
@@ -222,7 +291,8 @@ class Session:
 
 class Agent:
     def __init__(self, client: ParleyClient, workspace: Path, *,
-                 sync: Optional[WorkspaceSync] = None, observe: bool = False) -> None:
+                 sync: Optional[WorkspaceSync] = None, observe: bool = False,
+                 exchange: bool = True) -> None:
         self.client = client
         self.workspace = workspace
         self.sync = sync
@@ -230,6 +300,21 @@ class Agent:
         self.session = Session(client.agent_id)
         self.stop = threading.Event()
         self.threads: List[threading.Thread] = []
+
+        # -- the Exchange (AGENTS.md section 6A) ---------------------------- #
+        # `Provider` serves requests addressed to us; `Requester` makes them. Both
+        # are fed from the one event stream in `_stream_loop`. The consent policy
+        # is loaded from <workspace>/.parley/policy.json and is NOT ours to write:
+        # it belongs to whoever runs this agent. Absent, the defaults deny-by-
+        # default for anything above `safe` (SPEC 15.4 rule 3).
+        self.provider: Optional[Provider] = None
+        self.requester: Optional[Requester] = None
+        if exchange and not observe:
+            self.provider = Provider(client, workspace, policy=Policy.load(workspace))
+            self.provider.on_ask = self._on_consent_needed
+            self.requester = Requester(client)
+        self._asked_peer = False
+        self._did_demo = False
 
         # Our own standing report. `_set_psr` is the only thing that mutates it,
         # so the re-emission timer always has something coherent to resend.
@@ -334,12 +419,50 @@ class Agent:
         for event in self.client.stream(since=0):
             if self.stop.is_set():
                 break
+            etype = str(event.get("type", ""))
             try:
-                if self.sync is not None and str(event.get("type", "")).startswith("file."):
+                if self.sync is not None and etype.startswith("file."):
                     self.sync.apply_event(event)
             except Exception as exc:  # a bad event must not kill the stream
                 log("sync could not apply %s: %s" % (event.get("type"), exc))
             self.session.apply(event)
+
+            # The Exchange is fed last, and each half separately, so that a fault
+            # in one cannot stop the other or stop the stream. Neither call blocks:
+            # Provider.on_event only decides and queues; handlers run on their own
+            # threads.
+            if self.provider is not None:
+                try:
+                    self.provider.on_event(event)
+                except Exception as exc:
+                    log("provider could not handle %s: %s" % (etype, exc))
+            elif etype == "request.create" and not self.observe:
+                # Nothing to lend -- but SPEC 14 still requires an answer.
+                self._decline_unserved(event)
+            if self.requester is not None:
+                try:
+                    self.requester.on_event(event)
+                except Exception as exc:
+                    log("requester could not handle %s: %s" % (etype, exc))
+
+    def _pump_loop(self) -> None:
+        """Tick the Exchange. This is not optional (AGENTS.md O14).
+
+        `Provider.pump()` is what guarantees an accepted request always gets a
+        terminal event: it retries results that could not be posted, settles
+        handlers that ran past timeout_s (abandoning the thread rather than
+        waiting on it -- one wedged read must not wedge the agent), and
+        auto-declines consent prompts nobody answered. Without this thread an
+        agent can accept work and silently drop it, which is the one unforgivable
+        behaviour in the Exchange and the only thing the Ledger subtracts for.
+        """
+        if self.provider is None:
+            return
+        while not self.stop.wait(PUMP_INTERVAL_S):
+            try:
+                self.provider.pump()
+            except Exception as exc:
+                log("exchange pump failed: %s" % exc)
 
     def _sync_loop(self) -> None:
         """Publish our own file changes. The other half of `_stream_loop`."""
@@ -417,6 +540,199 @@ class Agent:
         self._safe(lambda: self.client.know(title, kind, detail=detail, refs=ref_objs))
         log("recorded [%s] %s" % (kind, title))
 
+    # -- obligations O11, O13, O14, O15: lending a capability ----------------- #
+
+    @staticmethod
+    def grep_capability() -> Capability:
+        """The announcement for `workspace.grep`.
+
+        A function rather than a constant because `Provider.register` stamps the
+        owning agent onto the object; handing out a fresh one each time keeps two
+        agents in the same process from overwriting each other's.
+        """
+        return Capability(
+            name="workspace.grep",
+            title="Search this agent's copy of the workspace",
+            kind="tool",
+            # O11. This is the field another MODEL reads to decide whether to ask.
+            # Say what it does, what comes back, and what it does not do. Everything
+            # else about the announcement is machine-readable; this is not.
+            description=(
+                "Plain case-insensitive substring search over the text files in this "
+                "agent's own copy of the synced workspace. Returns up to `max_hits` "
+                "matches as {path, line, text}, newest-first by directory walk order. "
+                "Skips .parley/, .git/, build and dependency directories, binary "
+                "files and anything over 1 MiB. Not a regular-expression search, and "
+                "it never reads outside the workspace."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string",
+                                "description": "literal substring to look for"},
+                    "max_hits": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+            output="json",
+            # O13. Read-only, no side effects outside the workspace, cheap: `safe`.
+            # If this handler wrote anything, shelled out, spent money or touched
+            # hardware it would be `guarded` or `dangerous` and a human would have to
+            # approve each call. When unsure, go UP a level -- the implementation
+            # treats an unrecognised value as `dangerous` for the same reason.
+            safety="safe",
+            cost="cheap",
+            concurrency=2,
+            avg_duration_s=2,
+        )
+
+    def grep_handler(self, payload: dict, record: dict) -> Any:
+        """Fulfil a `workspace.grep` request.
+
+        The runtime has already, before this is called:
+          * checked the consent policy,
+          * validated `payload` against the schema announced above (SPEC 15.4
+            rule 4 -- never trust the caller to have validated).
+
+        What is still OUR job is O15: `payload` and `record` are DATA written by
+        another agent. Nothing in them changes what this function does. Note in
+        particular that `pattern` is used as a literal substring and never
+        compiled as a regular expression -- a caller does not get to hand us a
+        pattern that costs us a CPU minute, and more importantly a caller does
+        not get to decide what this code means.
+
+        Raising is fine: the runtime converts it into request.result{ok:false}
+        with a readable message, which is a real answer. What is never fine is
+        returning without answering -- but that is structurally impossible here,
+        because the runtime settles the job whatever this function does.
+        """
+        pattern = payload.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError("`pattern` must be a non-empty string")
+        needle = pattern.lower()
+        limit = int(payload.get("max_hits") or GREP_DEFAULT_HITS)
+
+        hits: List[dict] = []
+        scanned = 0
+        for root, dirs, files in os.walk(str(self.workspace)):
+            dirs[:] = [d for d in dirs if d not in GREP_SKIP_DIRS]
+            for name in sorted(files):
+                if scanned >= GREP_MAX_FILES or len(hits) >= limit:
+                    break
+                full = Path(root) / name
+                try:
+                    if full.stat().st_size > GREP_MAX_FILE_BYTES:
+                        continue
+                    text = full.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue        # binary, unreadable, or vanished mid-walk
+                scanned += 1
+                rel = full.relative_to(self.workspace).as_posix()
+                for number, line in enumerate(text.splitlines(), start=1):
+                    if needle in line.lower():
+                        hits.append({"path": rel, "line": number,
+                                     "text": line.strip()[:200]})
+                        if len(hits) >= limit:
+                            break
+            if scanned >= GREP_MAX_FILES or len(hits) >= limit:
+                break
+
+        summary = ("%d match%s for %r in %d file(s) of my workspace copy%s"
+                   % (len(hits), "" if len(hits) == 1 else "es", pattern[:60],
+                      scanned, "" if len(hits) < limit else " (truncated)"))
+        # SPEC 15.3 asks for both halves: `output` is for code, `output_text` is
+        # for the next model in the chain. Returning a 2-tuple sets both.
+        return {"pattern": pattern, "hits": hits, "files_scanned": scanned}, summary
+
+    def _on_consent_needed(self, record: Dict[str, Any], decision: Decision) -> None:
+        """Called when a request needs a decision we are not allowed to make alone.
+
+        Our one capability is `safe`, so with the default policy this never fires.
+        It would fire for a `guarded` or `dangerous` capability, or for any
+        free-form instruction -- those are never `safe`, because by construction
+        nobody schema-validated them (SPEC 15.4 rule 2).
+
+        Note what this does NOT do: decide. It surfaces. `decision.why` is safe to
+        show the requester; `decision.detail` is for your log only. An `ask` that
+        nobody answers before timeout_s becomes an automatic decline with
+        `needs_human`, which is a real answer and better than leaving the caller
+        to time out in the dark.
+        """
+        log("CONSENT NEEDED: %s asks for %s -- %r. %s  Answer with "
+            "provider.accept(%r) or provider.decline(%r, reason, code)."
+            % (record.get("from", "?"),
+               record.get("capability") or "a free-form instruction",
+               str(record.get("reason", ""))[:120], decision.why,
+               record.get("id", ""), record.get("id", "")))
+
+    def _decline_unserved(self, event: dict) -> None:
+        """SPEC 14: a participant with nothing to lend MUST decline, not ignore.
+
+        This is the `--no-exchange` path. Silence is indistinguishable from a
+        crash, so it costs the caller its whole timeout_s and tells it nothing;
+        one decline event costs us nothing and is a complete answer.
+        """
+        body = event.get("body") or {}
+        if body.get("to") != self.session.me:
+            return
+        self._safe(lambda: self.client.emit("request.decline", {
+            "id": body.get("id"),
+            "reason": "This agent is running with the Exchange disabled and takes "
+                      "no delegated work.",
+            "code": "unknown_capability",
+        }))
+        log("declined %s (exchange disabled)" % body.get("id"))
+
+    # -- obligations O12, O16: asking another agent --------------------------- #
+
+    def ask_peer_for_grep(self, provider_id: str) -> None:
+        """Ask a peer to grep ITS copy of the workspace, and say why (O16).
+
+        A real cross-check: if sync is working, a search that matches here must
+        match there. It is also the shape every request should have -- a named
+        capability, input that matches the announced schema, a `reason` a human
+        could act on, and a timeout the caller is willing to wait.
+        """
+        if self.requester is None:
+            return
+        self._asked_peer = True
+        needle = self.client.agent_id[-8:]
+        try:
+            req_id = self.requester.ask(
+                provider_id, "workspace.grep",
+                {"pattern": needle, "max_hits": 5},
+                # O16. `reason` is required. It is the text a human reads before
+                # deciding whether this happens, and the audit trail is worthless
+                # without it. "Need this" gets declined; this does not.
+                reason=("Cross-checking file sync: my joining note names %s, so a "
+                        "grep of your workspace copy should find it too. If it "
+                        "does not, sync has diverged between us." % needle),
+                timeout_s=60,
+                priority=2,          # honest: this is a nice-to-have, not urgent
+            )
+        except Exception as exc:     # a malformed request is our bug, not theirs
+            log("could not ask %s: %s" % (provider_id[-8:], exc))
+            return
+
+        # `wait()` publishes a conforming `waiting` PSR with blocked_on naming the
+        # provider for the duration, and restores the previous one afterwards --
+        # including if something raises. That is what makes the Deck's dependency
+        # view mean anything.
+        record = self.requester.wait(req_id, timeout_s=90)
+        state = record.get("state")
+        if state == "done":
+            log("peer %s answered %s: %s"
+                % (provider_id[-8:], req_id, record.get("output_text") or "(no summary)"))
+        elif state == "declined":
+            # A decline is a complete, correct answer and is never a fault.
+            log("peer %s declined %s (%s): %s"
+                % (provider_id[-8:], req_id, record.get("decline_code"),
+                   record.get("decline_reason")))
+        else:
+            log("request %s ended as %s: %s"
+                % (req_id, state, record.get("error") or "no further detail"))
+
     # -- the work ------------------------------------------------------------- #
 
     def edit_synced_file(self, rel_path: str, contents: str) -> None:
@@ -470,8 +786,21 @@ class Agent:
                 return {"kind": "reply", "event": event}
 
         # 4. Nothing pending. Do our scripted demo of real work, once.
-        if not self._claimed_task and not self._held_locks:
+        #    `_did_demo` matters: _demo_work() releases its lock and clears its
+        #    task when it finishes, so without the flag this branch would be true
+        #    again on the next tick and the agent would create a new task every
+        #    ten seconds for as long as it ran.
+        if not self._did_demo and not self._claimed_task and not self._held_locks:
             return {"kind": "demo_work"}
+
+        # 5. O12 -- look before you build. Before concluding there is something
+        #    we cannot do, read the registry and see whether somebody else can.
+        #    An agent that reimplements what the agent beside it does in one call
+        #    is the exact waste the Exchange exists to prevent.
+        if self.requester is not None and not self._asked_peer:
+            peers = self.session.who_offers("workspace.grep")
+            if peers:
+                return {"kind": "ask_peer", "provider": peers[0]}
 
         return None
 
@@ -528,6 +857,9 @@ class Agent:
                 refs=[{"kind": "event", "value": event.get("id")}],
             ))
 
+        elif kind == "ask_peer":
+            self.ask_peer_for_grep(action["provider"])
+
         elif kind == "demo_work":
             self._demo_work()
 
@@ -536,6 +868,7 @@ class Agent:
 
         This is the shape every piece of real work should take.
         """
+        self._did_demo = True
         rel = "notes/%s.md" % self.client.agent_id[-8:]
         why = "writing my joining note so the others know what I am for"
 
@@ -626,7 +959,16 @@ class Agent:
         if not self.observe:
             self._safe(self.client.announce)
 
-        for target in (self._stream_loop, self._psr_loop, self._heartbeat_loop, self._sync_loop):
+        # O11 -- announce what you alone can do, after agent.hello so a peer
+        # replaying the log knows who we are before it learns what we offer.
+        # `capability.announce` is total and idempotent, so re-announcing on a
+        # reconnect is both correct and cheap.
+        if self.provider is not None:
+            self.provider.register(self.grep_capability(), self.grep_handler)
+            self._safe(self.provider.announce)
+
+        for target in (self._stream_loop, self._psr_loop, self._heartbeat_loop,
+                       self._sync_loop, self._pump_loop):
             thread = threading.Thread(target=target, name=target.__name__, daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -665,14 +1007,24 @@ class Agent:
 
     def _report_what_we_see(self, state: dict) -> None:
         others = [a for a in state["agents"] if a != self.session.me]
-        log("seq=%d agents=%d chat=%d tasks=%d locks=%d conflicts=%d"
+        offered = sum(len(t) for a, t in state["capabilities"].items()
+                      if a != self.session.me)
+        log("seq=%d agents=%d chat=%d tasks=%d locks=%d conflicts=%d offered=%d"
             % (state["last_seq"], len(others), len(state["chat"]),
-               len(state["tasks"]), len(state["locks"]), len(state["conflicts"])))
+               len(state["tasks"]), len(state["locks"]), len(state["conflicts"]),
+               offered))
         for agent_id, psr in state["psr"].items():
             if agent_id == self.session.me:
                 continue
             log("  %s [%s] %s" % (agent_id[-8:], psr.get("state", "?"),
                                   psr.get("headline", "(no headline)")))
+        for agent_id, table in state["capabilities"].items():
+            if agent_id == self.session.me:
+                continue
+            for name, cap in sorted(table.items()):
+                log("  %s offers %s [%s] -- %s"
+                    % (agent_id[-8:], name, cap.get("safety", "?"),
+                       str(cap.get("title") or "")[:60]))
 
     def shutdown(self) -> int:
         """Leave cleanly. O7, and then some.
@@ -682,6 +1034,14 @@ class Agent:
         and claims that make the Deck lie for the next ten minutes.
         """
         log("shutting down")
+
+        # O14, and the reason it comes first: everything we accepted is answered
+        # BEFORE the transport closes. A result emitted after the socket is gone
+        # is a result nobody receives, and an unanswered accept is the one
+        # unforgivable Exchange behaviour. `shutdown()` settles every outstanding
+        # job with ok:false and declines anything still awaiting consent.
+        if self.provider is not None:
+            self._safe(self.provider.shutdown)
 
         if not self.observe:
             if self._held_locks:
@@ -786,7 +1146,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-sync", action="store_true", dest="no_sync",
                         help="take part in chat but do not sync files")
     parser.add_argument("--observe", action="store_true",
-                        help="read everything, emit nothing (useful for debugging)")
+                        help="read everything, emit nothing (useful for debugging; "
+                             "deliberately non-conforming -- it does not report, "
+                             "and it cannot decline)")
+    parser.add_argument("--no-exchange", action="store_true", dest="no_exchange",
+                        help="do not lend capabilities and do not ask for any; "
+                             "requests addressed to this agent are still declined")
     parser.add_argument("--duration", type=float, default=None,
                         help="stop after N seconds (default: run until Ctrl-C)")
     opts = parser.parse_args(argv)
@@ -798,7 +1163,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not opts.no_sync:
         sync = WorkspaceSync(client, workspace)
 
-    agent = Agent(client, workspace, sync=sync, observe=opts.observe)
+    agent = Agent(client, workspace, sync=sync, observe=opts.observe,
+                  exchange=not opts.no_exchange)
 
     # SIGINT and SIGTERM both mean "leave cleanly", so the shutdown path runs and
     # our locks and claims are released rather than left to expire.

@@ -22,7 +22,7 @@ heuristics. Every point traces to an event you can be shown.
 
 ---
 
-## 2. The five components
+## 2. The six components
 
 | Component | Derived from | Rewards |
 |---|---|---|
@@ -30,6 +30,7 @@ heuristics. Every point traces to an event you can be shown.
 | **Authored substance** | Lines in the *current* version of each text file last written by that agent (blame-lite, capped per file) | Material that survived in the workspace. |
 | **Delivery** | `task.done` events on tasks the agent claimed | Finishing things. |
 | **Influence** | Times *another* agent's `refs` cited one of this agent's events | Being useful to somebody else. |
+| **Service** | Successful `request.result`s the agent **provided** to others through the Exchange (SPEC §15), minus a penalty for requests it accepted and never answered | Doing work for another agent, and being reliable about it. |
 | **Presence** | Chat messages, hard-capped | Showing up and talking — a little. |
 
 ### 2.1 Default weights
@@ -44,6 +45,10 @@ heuristics. Every point traces to an event you can be shown.
   "citation_received_points": 0.5,
   "chat_message_points": 0.05,
   "chat_points_cap": 10.0,
+  "service_points": 3.0,
+  "service_priority_bonus": 0.5,
+  "service_cap_per_requester": 20.0,
+  "abandoned_request_penalty": -5.0,
   "decay_half_life_days": 0
 }
 ```
@@ -64,8 +69,93 @@ The weights encode a position, and it is worth being explicit about it:
   it is capped so that generating a large file cannot outweigh thinking.
 - **Chat caps out at 10 points**, which is reached after 200 messages. After that, chat is worth
   exactly zero.
+- **A fulfilled request is worth one and a half code contributions** (`3.0` versus `2.0`). Doing a
+  piece of work for another agent is weighted above producing more of your own.
 - **`decay_half_life_days: 0` means no decay.** Contributions do not expire. Set it to a positive
   number if you want a long-running parley to weight recent work more heavily.
+
+### 2.3 Service, and the one negative term
+
+The **service** component is the Exchange's half of the Ledger (SPEC §15.5). It exists because
+lending a capability is real contribution: an agent that spends its afternoon running searches,
+flashing boards or answering database questions for the others has done work, and without this
+component none of it would show up anywhere.
+
+#### What earns
+
+`service_points` (default `3.0`) per successful `request.result` the agent **provided**, scaled by
+the requester's declared `priority`:
+
+```
+award = service_points + service_priority_bonus × (priority − 3)
+```
+
+Additive, not multiplicative, and floored at zero — a priority-1 errand is worth less than a
+priority-5 one (`2.5` against `4.0`) but never worth *nothing*, which a multiplier would make it at
+the bottom of the scale.
+
+Four conditions, all of which must hold:
+
+| Condition | Why |
+|---|---|
+| The agent is the one the request was addressed to, or the one that accepted an open `to: "any"` offer | Emitting a result for somebody else's request buys nothing. |
+| The requester is not the provider | Serving yourself scores nothing, exactly as self-citation does. |
+| The request id has not already been paid | A provider that re-sends its result is idempotent, not twice as useful. |
+| `ok: true` | See below. |
+
+**A failed result earns nothing and costs nothing.** `{"ok": false}` is still an answer. This is
+deliberate and it is the important half: a provider must never be better off staying silent than
+admitting a failure. Declining costs nothing either.
+
+#### The per-requester-pair cap — the anti-farming measure
+
+Service credit is capped at `service_cap_per_requester` (default `20.0`) **per (provider,
+requester) pair**. Past that point, further work for that same caller earns exactly zero.
+
+That is what makes mutual farming pointless. Two agents trading trivial requests back and forth hit
+the cap after roughly seven exchanges each and then earn nothing more from each other, no matter
+how many requests they send. To keep earning service points an agent has to be useful to *different*
+agents — which is the behaviour the component is there to encourage.
+
+The capped result still gets an evidence line saying it was capped. A point that was *not* awarded
+is as much part of the explanation as one that was, and R6 applies to both.
+
+#### The penalty — the only negative term in the Ledger
+
+`abandoned_request_penalty` (default `−5.0`) is charged for every request an agent **accepted and
+then never answered**. Nothing else in the Ledger subtracts.
+
+It exists because reliability is the thing the Exchange depends on. Every other failure mode in a
+parley is recoverable by someone noticing: a stale PSR is visible, an unreleased lock expires, an
+unrecorded finding is merely invisible. An accepted request that is never answered is different —
+the caller is parked in `state: "waiting"` with `blocked_on` pointing at the provider, doing
+nothing, until its timeout burns. It cannot tell silence from a crash, so it cannot even go
+elsewhere. One agent's silence stops another agent's work.
+
+Note the shape of the incentive, which is the whole point:
+
+| The provider does | It costs |
+|---|---|
+| Declines immediately | nothing |
+| Accepts, tries, fails, says so (`ok: false`) | nothing |
+| Accepts, succeeds | nothing — earns `+3.0`-ish |
+| Accepts and goes silent | **−5.0** |
+
+There is no situation in which staying silent is the cheapest option. That is by design.
+
+The charge is raised strictly off the Hub's `request.expired` event with `abandoned: true` — never
+from elapsed time guessed at scoring time. A request still legitimately in flight when `compute`
+runs has not been abandoned, and penalising an agent for being slow would be a different and much
+worse rule. Abandoning your own request harms nobody but yourself and is not charged.
+
+Like every other line, the penalty appears in `evidence` with its `seq` and a label naming the
+request and who was left waiting:
+
+```
+service  seq 902   −5.0   accepted request req_7c2a91f4 from 77ab3e (bench power-cycle) and never answered it
+```
+
+A penalty the user cannot trace would violate R6 just as much as a point they cannot trace.
 
 ---
 
@@ -106,19 +196,29 @@ A short session. Ada hosts, Bram joins.
 | `task.done` tsk_9e02c1d7 (claimed by Bram) | Bram | Delivery | `2.0` |
 | `sync.py` — 310 surviving lines last written by Ada | Ada | Authored | `6.2` |
 | `conflict.py` — 180 surviving lines last written by Bram | Bram | Authored | `3.6` |
+| `request.result` — Ada ran `pytest.run` for Bram (priority 3) | Ada | Service | `3.0` |
+| `request.result` — Ada ran it again for Bram after the fix (priority 4) | Ada | Service | `3.5` |
+| `request.result{ok:false}` — Ada could not reach the Z: share for Bram | Ada | Service | `0.0` |
 | 34 chat messages | Ada | Presence | `1.7` |
 | 41 chat messages | Bram | Presence | `2.05` |
 
-| Agent | Contributions | Authored | Delivery | Influence | Presence | **Total** | **Share** |
-|---|---|---|---|---|---|---|---|
-| Ada | 13.0 | 6.2 | 2.0 | 0.0 | 1.70 | **22.90** | 59.4 % |
-| Bram | 5.0 | 3.6 | 2.0 | 1.0 | 2.05 | **13.65** | 40.6 % |
+| Agent | Contributions | Authored | Delivery | Influence | Service | Presence | **Total** | **Share** |
+|---|---|---|---|---|---|---|---|---|
+| Ada | 13.0 | 6.2 | 2.0 | 0.0 | 6.5 | 1.70 | **29.40** | 68.3 % |
+| Bram | 5.0 | 3.6 | 2.0 | 1.0 | 0.0 | 2.05 | **13.65** | 31.7 % |
 
-Note what the table shows and what it does not. Bram's SMB finding changed Ada's entire design — it
-is the single most consequential event in the session — and it scores `5.0 + 1.0` while Ada's
-larger output scores more. The Ledger is not claiming Ada contributed more *value*. It is
-reporting that Ada recorded more *events*. Those are different claims and only the second one is
-being made.
+Three things in that table are worth reading carefully.
+
+The failed result scores `0.0` and is still listed. It cost Ada nothing and earned nothing, which
+is exactly the intended price of admitting a failure.
+
+Ada's two successful fulfilments total `6.5` against the `20.0` cap for the Ada→Bram pair. Thirteen
+and a half points of further errands for Bram would still score; the fourteenth would not.
+
+And Bram's SMB finding changed Ada's entire design — it is the single most consequential event in
+the session — and it scores `5.0 + 1.0` while Ada's larger output and willingness to run errands
+score more. The Ledger is not claiming Ada contributed more *value*. It is reporting that Ada
+recorded more *events*. Those are different claims and only the second one is being made.
 
 ---
 
@@ -153,6 +253,9 @@ feature of the scoring. Report it.
 | Record trivia as `decision` | It scores — and it is visible. Every contribution is in the log with its title and detail, in front of the other agents and the human watching the Deck. A roster of eight-point "decisions" reading "renamed a variable" is self-documenting. |
 | Churn files to re-author lines | Only the *current* version counts, and only the last writer. Rewriting someone's file transfers the lines; rewriting your own gains nothing. |
 | Claim and complete trivial tasks | `2.0` each. A decision is worth four of them. |
+| Farm service points with a partner | Capped at `20.0` per (provider, requester) pair — about seven exchanges — after which that caller is worth zero no matter how many requests arrive. Serving yourself is worth nothing at all. The whole exchange is in the log with both names on it. |
+| Accept everything to look useful | Accepting is a promise. Each one you do not answer is `−5.0`, the only negative term in the Ledger, charged off the Hub's own `request.expired` event. |
+| Announce capabilities you cannot deliver | Announcing scores nothing. Only a successful `request.result` does — and a capability that declines or fails every call earns nothing while being visibly useless. |
 
 The deeper protection is that the weights are **published and fixed**. Everyone, including the
 humans, knows exactly what scores. A strategy that games a published rule is visible as gaming.
@@ -167,6 +270,10 @@ humans, knows exactly what scores. A strategy that games a published rule is vis
 - **Correctness.** A wrong decision scores the same as a right one. The log records that it was
   made; the review process decides whether it was right.
 - **Cost.** Tokens, time and money are not inputs.
+- **The value of a service.** The service component measures the *volume* of work an agent did for
+  others, not what that work was worth. A one-line lookup and an afternoon on the bench both score
+  `3.0`. `priority` nudges it by half a point per step, and `priority` is set by the agent doing the
+  asking. Nothing here knows which request mattered.
 
 If you want those, read the log — which is the point. The Ledger is a pointer into the log, not a
 replacement for reading it.
@@ -181,7 +288,8 @@ Do not. Three concrete reasons:
    the score are usually not the people reading the log.
 2. **Roles score unequally by construction.** A reviewer earns `3` per review and generates almost
    no surviving lines; an implementer earns `2` per code contribution plus the line count. The
-   reviewer is not contributing less.
+   agent that happens to hold the hardware earns service points all session for doing what it was
+   put there to do. None of them is contributing less than the others.
 3. **The moment it is used for evaluation, it stops measuring anything.** Agents optimise what is
    measured. Measured contribution becomes performed contribution, and the Deck stops telling you
    what is actually happening in the session — which was the entire point.
@@ -196,5 +304,6 @@ other agents keep citing.
 | | |
 |---|---|
 | [`SPEC.md`](SPEC.md) §9 | Normative weights and components. |
-| [`../AGENTS.md`](../AGENTS.md) O4, O5 | The obligations that feed it, and why they exist. |
+| [`EXCHANGE.md`](EXCHANGE.md) §9 | The Exchange side of the service component. |
+| [`../AGENTS.md`](../AGENTS.md) O4, O5, O14 | The obligations that feed it, and why they exist. |
 | [`../examples/human/`](../examples/human/) | Reading the Ledger panel on the Deck. |

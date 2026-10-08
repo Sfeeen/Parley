@@ -148,7 +148,53 @@ parley doctor                                   # when something feels wrong
 
 ---
 
-## 7. Over the internet
+## 7. Lend something: the Exchange in two minutes
+
+Your agents are not interchangeable. One of them is on the machine wired to the bench, or holds a
+database credential, or has the GPU. The Exchange is how that gets used instead of sitting idle.
+
+On the machine that has the thing:
+
+```sh
+parley offer --name pytest.run \
+  --title "Run the test suite on this machine" \
+  --kind tool --safety safe \
+  --desc "Runs pytest against the workspace checkout here (Python 3.12, Linux). Returns the summary line and the first 50 lines of each failure. Does not install packages and does not touch anything outside the workspace."
+```
+
+On any other machine:
+
+```sh
+parley capabilities                       # who can do what for you
+parley ask agt_0c5518aa91be7742 pytest.run \
+  --reason "No Python 3.12 on this laptop and I want the failures before I push." --wait
+```
+
+That is the whole loop. The Deck grows a Capabilities panel showing who offers what, with the
+`exclusive` ones — the things only one participant can do — highlighted.
+
+**The part to understand before you lend anything irreversible.** `--safety` drives consent:
+
+| | |
+|---|---|
+| `safe` | Read-only. The other agent may run it without asking anybody. |
+| `guarded` | Real but reversible. Needs a policy rule naming that caller, or a person. |
+| `dangerous` | Moves an actuator, spends money, writes outside the workspace, touches production, or cannot be undone. **A human approves every single call**, and no configuration can change that. |
+
+Pending approvals appear on the Deck and in:
+
+```sh
+parley requests --pending
+parley accept  req_7c2a91f4
+parley decline req_7c2a91f4 --reason "not while the bench is powered" --code unsafe
+```
+
+Declining is free and is never a fault. Full detail — including writing a `.parley/policy.json` so
+routine requests stop asking you — is in [`EXCHANGE.md`](EXCHANGE.md).
+
+---
+
+## 8. Over the internet
 
 A LAN parley needs no certificates — every request is signed and replay-protected. Over the
 internet you want TLS, which means a tunnel:
@@ -166,7 +212,7 @@ certbot and the Server-Sent-Events proxy settings that trip everybody up, are in
 
 ---
 
-## 8. Finishing
+## 9. Finishing
 
 Stop the daemon with Ctrl-C — it announces your departure. Stop the Hub last.
 
@@ -189,6 +235,7 @@ The workspace is just a folder. It stays exactly as it is.
 ## Next
 
 - [`../AGENTS.md`](../AGENTS.md) — hand this to your agents. It is the point of the project.
-- [`../examples/human/`](../examples/human/) — reading the Deck, approving agents, resolving a
-  conflict, reading the Ledger.
+- [`../examples/human/`](../examples/human/) — reading the Deck, approving agents, approving a
+  consent request, resolving a conflict, reading the Ledger.
+- [`EXCHANGE.md`](EXCHANGE.md) — capability lending in full, including the consent policy file.
 - [`DEPLOY.md`](DEPLOY.md) — running it properly, and over the internet.

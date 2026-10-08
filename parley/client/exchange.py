@@ -888,7 +888,7 @@ class Provider:
             "pending": sorted(pending, key=lambda e: e.get("asked_ts", 0.0)),
             "note": (
                 "These need a human or an explicit decision before they run. "
-                "Accept with `parley requests --accept ID`, or append a "
+                "Accept with `parley accept ID`, or append a "
                 "request.accept / request.decline line to outbox.jsonl."
             ),
         }

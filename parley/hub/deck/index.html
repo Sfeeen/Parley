@@ -88,6 +88,54 @@
         </div>
       </section>
 
+      <!-- ── Capabilities (SPEC §15.1/§15.2) ── -->
+      <section class="panel" id="panelCaps" aria-labelledby="hCaps">
+        <header class="panel__head">
+          <h2 class="panel__title" id="hCaps">Capabilities</h2>
+          <span class="panel__rule" aria-hidden="true"></span>
+          <p class="panel__meta" id="capsMeta"></p>
+        </header>
+        <div class="panel__body">
+          <ul class="legend legend--wrap">
+            <li><span class="badge badge--excl" aria-hidden="true">only</span>Only this agent can do it</li>
+            <li><span class="badge badge--danger" aria-hidden="true">danger</span>Needs a human approval, every call</li>
+            <li><span class="slots__cells" aria-hidden="true"><span class="slots__cell is-on"></span><span class="slots__cell"></span></span>In flight / free slots</li>
+          </ul>
+          <div class="capgroups" id="capGroups"></div>
+          <p class="note" id="capsNote">What each agent will do <b>for the others</b>, announced by that agent. A
+            capability marked <b>only this agent</b> is the reason this parley is worth more than the same agents
+            working alone. <b>Safety is self-declared</b> — the Deck reports what the provider claimed, and a
+            provider may always decline.</p>
+        </div>
+      </section>
+
+      <!-- ── Requests in flight (SPEC §15.3) ── -->
+      <section class="panel" id="panelReqs" aria-labelledby="hReqs">
+        <header class="panel__head">
+          <h2 class="panel__title" id="hReqs">Requests</h2>
+          <span class="panel__rule" aria-hidden="true"></span>
+          <p class="panel__meta" id="reqsMeta"></p>
+        </header>
+        <div class="panel__body">
+          <div class="reqsec">
+            <h3 class="subhead">In flight</h3>
+            <div class="reqs" id="reqsLive"></div>
+          </div>
+          <div class="reqsec" id="reqsConsentSec" hidden>
+            <p class="note" id="reqsConsentNote"></p>
+          </div>
+          <div class="reqsec" id="reqsHistSec" hidden>
+            <h3 class="subhead">Settled</h3>
+            <div class="reqhist" id="reqsHist"></div>
+            <button type="button" class="reqmore" id="reqsMoreBtn" hidden></button>
+          </div>
+          <p class="note" id="reqsNote">A request is a <b>proposal, not a command</b>: every agent decides for
+            itself, and declining is never a fault. The clock on each row is elapsed against the caller's
+            <b>timeout_s</b> — a request that runs out is auto-declined, and one its provider had already
+            <b>accepted</b> and then abandoned is charged against that agent in the Ledger.</p>
+        </div>
+      </section>
+
       <!-- ── Ledger ── -->
       <section class="panel" id="panelLedger" aria-labelledby="hLedger">
         <header class="panel__head">
@@ -96,12 +144,14 @@
           <p class="panel__meta" id="ledgerMeta"></p>
         </header>
         <div class="panel__body">
-          <ul class="legend" id="ledgerLegend">
+          <ul class="legend legend--wrap" id="ledgerLegend">
             <li><span class="sw lc-1" aria-hidden="true"></span>Contributions</li>
             <li><span class="sw lc-2" aria-hidden="true"></span>Authored substance</li>
             <li><span class="sw lc-3" aria-hidden="true"></span>Delivery</li>
             <li><span class="sw lc-4" aria-hidden="true"></span>Influence</li>
-            <li><span class="sw lc-5" aria-hidden="true"></span>Presence</li>
+            <li><span class="sw lc-5" aria-hidden="true"></span>Service</li>
+            <li><span class="sw lc-6" aria-hidden="true"></span>Presence</li>
+            <li id="ledgerLegendPenalty" hidden><span class="sw sw--penalty" aria-hidden="true"></span>Deducted — a request accepted and never answered</li>
           </ul>
           <div class="ledger" id="ledger"></div>
           <p class="note note--caveat">The Ledger measures <b>recorded contribution, not quality</b>. It counts events
@@ -129,6 +179,7 @@
             </div>
             <ul class="legend legend--wrap">
               <li><span class="sw sw--line" aria-hidden="true"></span>Thicker link = more shared work</li>
+              <li><span class="sw sw--fil" aria-hidden="true"></span>Delegated work inside that link</li>
               <li><span class="sw sw--block" aria-hidden="true"></span>Blocked on (arrow points at the blocker)</li>
             </ul>
             <div class="scrollx">

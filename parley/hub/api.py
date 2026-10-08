@@ -43,6 +43,7 @@ from ..errors import (
     TooLarge,
     UnknownAgent,
 )
+from ..exchange import REQUEST_STATES
 from ..jsonutil import dumps, loads, now_rfc3339, sha256_hex
 from ..version import WIRE_VERSION
 from .store import normalise_blob_hash, wire_blob_hash
@@ -200,6 +201,7 @@ def redact_path(raw: str) -> str:
 _EXACT_ROUTES = frozenset({
     "/v1/hello", "/v1/enroll", "/v1/events", "/v1/stream", "/v1/state",
     "/v1/index", "/v1/ledger", "/v1/blobs", "/v1/me",
+    "/v1/capabilities", "/v1/requests",
 })
 _PREFIX_ROUTES = ("/v1/blobs/", "/v1/admin/")
 
@@ -713,6 +715,16 @@ def _route(hub, method: str, raw_path: str, headers: Mapping[str, str], body: by
             raise MethodNotAllowed("GET only", hint="GET /v1/ledger")
         return json_response(hub, 200, hub.view.ledger())
 
+    if path == "/v1/capabilities":
+        if method not in ("GET", "HEAD"):
+            raise MethodNotAllowed("GET only", hint="GET /v1/capabilities")
+        return json_response(hub, 200, hub.view.capabilities())
+
+    if path == "/v1/requests":
+        if method not in ("GET", "HEAD"):
+            raise MethodNotAllowed("GET only", hint="GET /v1/requests?state=&to=&from=")
+        return _get_requests(hub, query, for_viewer=(kind == "viewer"))
+
     if path == "/v1/blobs":
         if method != "POST":
             raise MethodNotAllowed("POST only", hint="POST /v1/blobs with the raw bytes.")
@@ -768,6 +780,23 @@ def _rate_limited(wait: float) -> RateLimited:
         detail={"retry_after_s": int(wait)},
         hint="Back off for %d s. Per-agent limits are 60 events/min (burst 120) and "
         "120 blob ops/min." % int(wait),
+    )
+    setattr(err, "retry_after", int(wait))
+    return err
+
+
+def _rate_limited_requests(wait: float) -> RateLimited:
+    """The §15.6 limit, said in its own words.
+
+    A caller told only "rate limit exceeded" after 20 `request.create`s would go
+    looking at the §12.1 event budget, which it has not come near.
+    """
+    err = RateLimited(
+        "request.create rate limit exceeded",
+        detail={"retry_after_s": int(wait), "limit": "20 request.create/min"},
+        hint="SPEC §15.6 allows 20 request.create per agent per minute. Back off for "
+        "%d s. If you are fanning work out, send one `to: \"any\"` request rather "
+        "than one per candidate provider." % int(wait),
     )
     setattr(err, "retry_after", int(wait))
     return err
@@ -956,9 +985,19 @@ def _post_events(hub, agent: dict, body: bytes, query: Dict[str, str]):
         if not isinstance(item, dict):
             raise BadEvent("every element of `events` must be an object", hint="See SPEC §2.")
 
-    wait = hub.limiter.check(agent_id, "events", time.time(), float(len(raw)))
+    now = time.time()
+    wait = hub.limiter.check(agent_id, "events", now, float(len(raw)))
     if wait:
         raise _rate_limited(wait)
+
+    # SPEC §15.6, on top of §12.1: asking peers to do work is rationed harder
+    # than talking to them, because every accepted request spends somebody else's
+    # time.  Counted across the batch, so 64 requests in one POST cost 64.
+    creates = sum(1 for item in raw if item.get("type") == "request.create")
+    if creates:
+        wait = hub.limiter.check(agent_id, "request_create", now, float(creates))
+        if wait:
+            raise _rate_limited_requests(wait)
 
     results, stored = hub.append(raw, agent=agent)
     resp: Dict[str, Any] = {
@@ -982,6 +1021,39 @@ def _get_events(hub, query: Dict[str, str]):
         200,
         {"events": events, "head_seq": hub.store.head_seq(), "since": since},
     )
+
+
+def _get_requests(hub, query: Dict[str, str], *, for_viewer: bool):
+    """SPEC §15.3's delegation view, with the §5 ``state``/``to``/``from`` filters.
+
+    ``state`` takes one state or a comma-separated list.  A name that is not a
+    §15.3 state is an error rather than an empty result: a caller polling
+    ``?state=accepeted`` would otherwise conclude that nobody ever accepts
+    anything and never find out why.
+    """
+    raw_state = (query.get("state") or "").strip()
+    states = [s.strip() for s in raw_state.split(",") if s.strip()] if raw_state else []
+    unknown = [s for s in states if s not in REQUEST_STATES]
+    if unknown:
+        raise BadRequest(
+            "unknown request state in the `state` filter",
+            detail={"unknown": unknown[:8], "states": list(REQUEST_STATES)},
+            hint="state is one of " + ", ".join(REQUEST_STATES)
+            + "; pass several as a comma-separated list.",
+        )
+    payload = hub.view.requests(
+        state=states,
+        to=(query.get("to") or "").strip(),
+        from_agent=(query.get("from") or "").strip(),
+        for_viewer=for_viewer,
+    )
+    payload["count"] = len(payload["in_flight"]) + len(payload["recent"])
+    payload["filters"] = {
+        "state": states,
+        "to": (query.get("to") or "").strip(),
+        "from": (query.get("from") or "").strip(),
+    }
+    return json_response(hub, 200, payload)
 
 
 def _get_index(hub, query: Dict[str, str]):

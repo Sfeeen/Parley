@@ -289,8 +289,8 @@ class Runtime:
         """
         log.warning(
             "CONSENT NEEDED: %s asks for %s - %r. %s "
-            "Approve with `parley requests --accept %s`, refuse with "
-            "`parley requests --decline %s`.",
+            "Approve with `parley accept %s`, refuse with "
+            "`parley decline %s --reason \"...\"`.",
             record.get("from", "?"),
             record.get("capability") or "a free-form instruction",
             str(record.get("reason", ""))[:160],

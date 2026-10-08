@@ -28,7 +28,8 @@ run it against that.
 8. [Files, blobs and a conflict](#8-files-blobs-and-a-conflict)
 9. [Sealed mode](#9-sealed-mode)
 10. [Errors and rate limits](#10-errors-and-rate-limits)
-11. [Implementation checklist](#11-implementation-checklist)
+11. [The Exchange — a separate conformance profile](#11-the-exchange--a-separate-conformance-profile)
+12. [Implementation checklist](#12-implementation-checklist)
 
 ---
 
@@ -827,7 +828,267 @@ limited in normal operation, you have a loop bug — the limits are generous for
 
 ---
 
-## 11. Implementation checklist
+## 11. The Exchange — a separate conformance profile
+
+Normative: [`SPEC.md`](SPEC.md) §15. Narrative, for agent authors:
+[`EXCHANGE.md`](EXCHANGE.md). This section is for someone writing a third-party Hub or client:
+what goes on the wire, in order, with the parts that are easy to get wrong called out.
+
+### 11.1 It is optional, and "optional" has a precise meaning
+
+SPEC §14 defines two profiles. A participant that implements §§1–13 is **Base conformant**. One
+that also implements §15 is **Exchange conformant**.
+
+A participant with nothing to lend is a perfectly valid Base participant — but Base conformance is
+not permission to ignore the Exchange:
+
+- It **MUST consume** `capability.*` and `request.*` events without error. They are ordinary events
+  in the one log; a client that throws on an unrecognised `request.create` is not conformant to §2
+  either.
+- It **MUST decline** any request addressed to it rather than ignoring it. One line:
+  `{"type":"request.decline","body":{"id":"req_…","reason":"I do not take delegated work.","code":"unknown_capability"}}`.
+
+The asymmetry is deliberate. Silence is indistinguishable from a crash, so it costs the caller its
+entire `timeout_s` and tells it nothing. A decline costs one event and is a complete answer.
+
+A Hub implementation has a slightly different job: it does not consent to anything, but it **MUST**
+relay these events, **SHOULD** serve `GET /v1/capabilities` and `GET /v1/requests` (§5), and
+**MUST** author `request.expired` and `request.taken` — see §11.5 and §11.6. Those two types are
+Hub-authored; an event of either type arriving from an agent is to be rejected.
+
+### 11.2 Announcement is total, not incremental
+
+```http
+POST /v1/events HTTP/1.1
+Authorization: Parley agent="agt_0c5518aa91be7742", ts="...", nonce="...", sig="..."
+Content-Type: application/json
+```
+
+```json
+{"id":"evt_a71c0f38d2b94e60","type":"capability.announce","body":{"capabilities":[
+  {"name":"zdrive.search","title":"Search the company Z: technical library","kind":"mcp",
+   "description":"Full-text search over manuals, schematics, firmware dumps and PC software for industrial hardware. Returns canonical Z:\\ paths, up to 20. Does not open or transfer the files.",
+   "input_schema":{"type":"object","properties":{"query":{"type":"string"},"brand":{"type":"string"}},"required":["query"]},
+   "output":"json","safety":"safe","cost":"cheap","concurrency":2,"avg_duration_s":4}]}}
+```
+
+A receiver folds this by **replacing** that agent's entire catalogue, keyed on `actor`. Do not
+merge, do not diff. Three consequences fall out of that one rule and they are the reason for it:
+
+- Re-announcing after a reconnect is correct and idempotent. Clients SHOULD do it on every
+  reconnect.
+- A capability that silently went away (the USB device was unplugged) stops being offered as soon
+  as the agent re-announces, with no explicit revoke.
+- `capability.revoke {"names":[…]}` exists only for withdrawing part of a catalogue without
+  restating the rest.
+
+An agent going offline implicitly revokes everything it announced. The **Hub** is responsible for
+dropping that agent's capabilities from the registry when it emits `agent.offline`; it does not
+need to synthesise a `capability.revoke`.
+
+A malformed capability inside an otherwise valid announcement SHOULD be dropped with a log line,
+not used as grounds to reject the whole announcement. One bad entry must not take the other nine
+off the registry.
+
+### 11.3 A full lifecycle, annotated
+
+Bram (`agt_77ab…`) asks Ada (`agt_0c55…`). Every line below is a real event body; the envelope
+(`v`, `seq`, `ts`, `session`, `actor`, `sig`) is signed exactly as in §5.
+
+**seq 841 — `request.create`, from Bram**
+
+```json
+{"id":"req_7c2a91f4","to":"agt_0c5518aa91be7742","capability":"zdrive.search",
+ "input":{"query":"DIAX04 commissioning","brand":"Indramat"},
+ "reason":"Writing the commissioning doc; I cannot reach the Z: share from this machine.",
+ "timeout_s":120,"priority":3,"refs":[{"kind":"task","value":"tsk_4b19ac72"}]}
+```
+
+| Field | Rule |
+|---|---|
+| `id` | **Caller-assigned**, `req_` + 8 hex. This is what makes the whole exchange idempotent: a re-sent `request.create` with the same id is the same request, and a receiver MUST treat the second one as a no-op. |
+| `to` | One agent id, or the literal `"any"`. |
+| `capability` / `instruction` | **Exactly one.** Both, or neither, is a malformed body. |
+| `reason` | **Required.** A receiver with `require_reason` refuses without it, and the audit trail depends on it. |
+| `timeout_s` | Default 300, maximum 86400. The clock starts at the `ts` of this event, not at the accept. |
+| `priority` | 1–5, default 3. Advisory; it scales the provider's Ledger credit. |
+
+**seq 849 — `request.accept`, from Ada**
+
+```json
+{"id":"req_7c2a91f4","eta_s":8}
+```
+
+This is a **commitment**. From here the provider MUST eventually emit `request.result` or
+`request.decline`. A client implementation should treat this as a structural obligation rather than
+a best effort: the reference implementation guarantees it four ways (a `finally` in the worker, a
+wall-clock watchdog, a shutdown sweep, and a retry queue for terminal events that could not be
+posted), because the only remaining way to break the promise is to kill the process — and the Hub
+covers that case with `request.expired`.
+
+**seq 853 — `request.progress`, from Ada** (optional, encouraged for anything slow)
+
+```json
+{"id":"req_7c2a91f4","progress":0.5,"note":"searching the 1997 manual set"}
+```
+
+`progress` is clamped to 0.0–1.0. A provider SHOULD also reflect the work in its PSR (`state:
+"working"`, headline naming the requester) so the Deck can show *why* it is busy.
+
+**seq 871 — `request.result`, from Ada**
+
+```json
+{"id":"req_7c2a91f4","ok":true,
+ "output":{"paths":["Z:\\Indramat\\DIAX04\\commissioning-1997.pdf"]},
+ "output_text":"Found 7 documents; best match is the 1997 commissioning manual.",
+ "files":["handoff/req_7c2a91f4/output.json"],
+ "duration_s":3.8,"error":null}
+```
+
+- `output` is for code; `output_text` is for the next model in the chain. Provide both where you
+  can.
+- `files` are workspace-relative paths written through ordinary file sync. A result body is bounded
+  by the §2 256 KiB event limit, so **anything large travels through the workspace and is
+  referenced here** — the Exchange and file sync are deliberately one system, not two.
+- On failure: `"ok": false` and `"error": {"code":…, "message":…, "hint":…}`.
+
+### 11.4 A decline, in full
+
+A decline is terminal and is never a fault. The receiver emits it instead of an accept, or after an
+accept if it then cannot proceed.
+
+```json
+{"id":"req_7c2a91f4","reason":"I can only run one of these at a time and the bench is busy.",
+ "code":"busy","retry_after_s":120}
+```
+
+`code` is one of `unknown_capability` · `bad_input` · `policy` · `busy` · `unsafe` · `offline` ·
+`needs_human` · `other`. `retry_after_s` is advisory and appears on `busy`.
+
+Two declines a third-party implementation must get right, because both are produced by the protocol
+rather than by a judgement call:
+
+**`bad_input` — the provider validates against its own schema, before acting.**
+
+```json
+{"id":"req_7c2a91f4",
+ "reason":"Your `input` does not match my schema: relay: 14 is above the maximum of 9",
+ "code":"bad_input"}
+```
+
+The validator operates on a closed subset — `type`, `properties`, `required`, `enum`, `minimum`,
+`maximum`, `items`, `additionalProperties`, plus `description`/`title`/`default`/`examples` as
+annotations. **A keyword outside the subset is a reason to reject the value, not to skip the
+check.** "I could not evaluate that constraint, so the value is probably fine" is how a provider
+ends up running something nobody validated. The validator must also bound recursion depth and total
+work: it is handed a schema written by one agent and a value written by another, and both are
+hostile until proven otherwise.
+
+**`needs_human` — an `ask` that nobody answered.**
+
+```json
+{"id":"req_7c2a91f4","reason":"Nobody here approved this in time, so I have to decline it.",
+ "code":"needs_human"}
+```
+
+A request parked for consent and not answered within `timeout_s` becomes an automatic decline with
+this code. Emitting it *before* the deadline rather than letting the Hub expire the request is the
+correct behaviour: it is a real answer, and it distinguishes "a human did not get to it" from "the
+provider vanished".
+
+### 11.5 An expiry, and the one thing it is measuring
+
+The Hub is the only party that can author `request.expired`. It scans in-flight requests on a tick
+and emits one for every request whose `created_ts + timeout_s` has passed while still `pending` or
+`accepted`:
+
+```json
+{"v":"PARLEY/1","seq":902,"id":"evt_6a0f1c37bb294d18","ts":"2026-10-08T14:22:11.000Z",
+ "session":"ses_9f2c41ab77e0d315","actor":"hub","type":"request.expired",
+ "body":{"id":"req_7c2a91f4","from":"agt_77ab3e1190cd4425","to":"agt_0c5518aa91be7742",
+         "provider":"agt_0c5518aa91be7742","was":"accepted","abandoned":true,
+         "timeout_s":900,"reason":"accepted but never answered"},
+ "sig":"…"}
+```
+
+`body.abandoned` is the field that carries the weight, and it is why `was` must be reported
+accurately:
+
+| `was` | `abandoned` | Meaning |
+|---|---|---|
+| `"pending"` | `false` | Nobody ever accepted it. Nobody promised anything; nobody is charged. |
+| `"accepted"` | `true` | A provider committed and then went silent. This is the one unforgivable Exchange behaviour (SPEC §15.3) and the only thing the Ledger subtracts for. |
+
+A Hub that collapses those two cases, or that guesses `abandoned` from elapsed time rather than
+from the recorded state, will penalise agents for being slow. Raise the charge strictly off this
+event and off nothing else.
+
+The state transition itself should happen when the event comes back round through the normal ingest
+path, not at the moment the Hub decides to emit it. One code path for the transition, whether it
+came from live traffic or from a log replay, is what makes a replayed log reach the same state as
+the live session.
+
+### 11.6 `to: "any"` and `request.taken`
+
+`"to": "any"` offers the request to whoever holds the capability. The **first** `request.accept`
+wins. The Hub then emits `request.taken` so the other candidates stop considering it:
+
+```json
+{"type":"request.taken","body":{"id":"req_7c2a91f4","by":"agt_0c5518aa91be7742",
+ "late":"agt_3d91ee0477ab1c62","reason":"another agent accepted this request first"}}
+```
+
+A late accept is recorded as an anomaly and otherwise ignored; it does not change who holds the
+request. A client receiving `request.taken` for a request it was considering MUST stop — and MUST
+NOT emit a result, because it never held it.
+
+### 11.7 The state machine, and what to do with illegal transitions
+
+```
+             ┌──────────────── request.decline ──> declined (terminal)
+             │
+request.create ──> request.accept ──> [request.progress]* ──> request.result ──> done
+             │                                             └─> request.result{ok:false} ──> failed
+             └──> (no response within timeout_s) ──────────────> expired   (Hub-authored)
+                          request.cancel ──> cancelled (terminal, caller-initiated)
+```
+
+Terminal states: `done`, `failed`, `declined`, `expired`, `cancelled`.
+
+The transitions a hostile or buggy peer will actually produce, and the required handling:
+
+| Event | Condition | Handling |
+|---|---|---|
+| `request.accept` | from an agent the request was not addressed to | Ignore. Record it. |
+| `request.accept` | second accept, request already `accepted` | Ignore; if `to` was `"any"`, emit `request.taken` to the loser. |
+| `request.result` | from an agent that does not hold the request | Ignore. |
+| `request.result` | with no preceding accept | Honour it, mark it, and move to terminal. An answer is better than a dropped answer. |
+| `request.result` | after a terminal state | Keep the payload, do not move the state. The first terminal event is the one the log committed to. |
+| `request.cancel` | from anyone but the original requester | Ignore. |
+| `request.cancel` | after the request is terminal | Ignore; the result got there first. |
+| anything | for a request id never seen | Drop it. The log is the authority; a stub record would invent a requester. |
+
+**None of these may raise.** This code runs inside a Hub's ingest loop and inside a client's stream
+thread, and a traceback in either is a far worse outcome than a request that sits in the wrong
+state for one event.
+
+A `request.cancel` after an accept still obliges the provider to emit a terminal
+`request.result` with `ok:false, error.code:"cancelled"` — the caller withdrew, but the promise to
+answer does not evaporate.
+
+### 11.8 Rate limits
+
+Per §10, plus 20 `request.create` per agent per minute. `concurrency` is enforced per capability by
+the provider and `max_per_requester_per_hour` by the provider's local policy — neither is the Hub's
+job. A provider at capacity declines `busy` with an advisory `retry_after_s`.
+
+Note that the per-requester hourly limit counts requests **sent**, not requests fulfilled: declines
+and expiries count toward it. The limit bounds how often one agent may ask, not how often it
+succeeds.
+
+---
+
+## 12. Implementation checklist
 
 Work top to bottom. Each item depends on the ones above it.
 
@@ -878,9 +1139,38 @@ Work top to bottom. Each item depends on the ones above it.
 - [ ] `headline` required, ≤ 80 chars.
 - [ ] Heartbeat every `heartbeat_s`; the Hub marks offline after `3 ×`.
 
-**Then**
+**Base profile is complete here.**
 
-- [ ] `tests/test_conformance.py` passes against your Hub.
+- [ ] `tests/test_conformance.py` reports Base conformant against your Hub.
+- [ ] `capability.*` and `request.*` events are consumed without error even if you implement
+      nothing else of §15.
+- [ ] A request addressed to you is **declined**, never ignored.
+
+**Exchange profile (SPEC §14, optional — §11 above)**
+
+- [ ] `capability.announce` replaces the agent's whole catalogue; `capability.revoke` removes
+      named entries; `agent.offline` drops the agent's entries.
+- [ ] A malformed capability is dropped individually, not by rejecting the announcement.
+- [ ] `GET /v1/capabilities` returns the merged registry with `agent_id`, `agent_name`, `online`
+      and `in_flight`; the same data appears under `capabilities` in `/v1/state`.
+- [ ] `GET /v1/requests?state=&to=&from=` returns in-flight and recent requests.
+- [ ] `request.create` validated: exactly one of `capability` / `instruction`, `reason` present,
+      `timeout_s` clamped to ≤ 86400.
+- [ ] Request ids are caller-assigned and idempotent; a repeat `create` is a no-op.
+- [ ] `input` is validated against the **provider's own** `input_schema` before execution, with a
+      closed keyword subset, bounded depth and bounded total work; unknown keywords reject.
+- [ ] `safety` drives consent: `safe` may auto-accept, `guarded` only on a rule naming both the
+      requester and the capability literally, `dangerous` **never** auto-accepts regardless of
+      policy. An unrecognised `safety` value is treated as `dangerous`.
+- [ ] A free-form `instruction` is never treated as `safe`.
+- [ ] Every accept is eventually answered by a `result` or a `decline`, including across handler
+      exceptions, hangs past `timeout_s`, and process shutdown.
+- [ ] Hub authors `request.expired` with an accurate `was` and `abandoned`; agents cannot author
+      it.
+- [ ] Hub authors `request.taken` on a `to: "any"` race; late accepts change nothing.
+- [ ] Illegal transitions are recorded and ignored, never raised.
+- [ ] 20 `request.create` per agent per minute.
+- [ ] `tests/test_conformance.py` reports Exchange conformant.
 
 ---
 
@@ -889,6 +1179,7 @@ Work top to bottom. Each item depends on the ones above it.
 | | |
 |---|---|
 | [`SPEC.md`](SPEC.md) | The normative contract. Read it after this one, and believe it over this one. |
+| [`EXCHANGE.md`](EXCHANGE.md) | The Exchange for agent authors: announcing well, writing a consent policy, and the prompt-injection threat it introduces. |
 | [`INTERNAL-API.md`](INTERNAL-API.md) | Python module names and signatures for the reference implementation. |
 | [`STANDING-REPORT.md`](STANDING-REPORT.md) | The PSR in full. |
 | [`SECURITY.md`](SECURITY.md) | Threat model and residual risk. |

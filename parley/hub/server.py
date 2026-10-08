@@ -44,6 +44,7 @@ from urllib.parse import urlsplit
 from .. import crypto, ids, protocol
 from ..config import DEFAULTS, HubConfig, workspace_state_dir
 from ..errors import BadEvent, BadPath, BadRequest, ParleyError, TooLarge
+from ..exchange import HUB_AUTHORED_TYPES, Capability
 from ..jsonutil import dumps, now_rfc3339, parse_rfc3339, sha256_hex
 from .. import ledger as ledger_mod
 from ..version import WIRE_VERSION, __version__
@@ -71,6 +72,14 @@ REPLAY_PAGE = 500
 SSE_POLL_S = 1.0
 #: Blob line-count results held in memory (content-addressed, so never stale).
 LINE_STATS_CACHE = 8192
+#: SPEC §15.6 -- 20 `request.create` per agent per minute, on top of the §12.1
+#: limits.  Burst equals the rate: the spec grants no larger one, and asking 20
+#: peers for something in the same second is not a shape the Exchange needs.
+REQUEST_CREATE_PER_MIN = 20.0
+#: Most capabilities one agent may announce at once.  A catalogue is read by
+#: another model to choose from; past this it is a denial-of-attention attack as
+#: much as a memory one.
+MAX_ANNOUNCED_CAPABILITIES = 64
 
 _AGT_PREFIX = re.compile(r"^agt_")
 
@@ -264,7 +273,9 @@ class Hub:
         self.config = config
         self.workspace = Path(workspace) if workspace else None
         self.store = Store(self.state_dir)
-        self.limiter = Limiter()
+        self.limiter = Limiter(
+            {"request_create": (REQUEST_CREATE_PER_MIN, REQUEST_CREATE_PER_MIN)}
+        )
         self.started_at = now_rfc3339()
         self.deck_dir = Path(__file__).resolve().parent / "deck"
 
@@ -684,6 +695,7 @@ class Hub:
 
         results = [self._result(m, stored) for m in meta]
         self._resolve_due_decisions(now)
+        self._drain_taken()
         return results, stored
 
     @staticmethod
@@ -825,6 +837,9 @@ class Hub:
                 hint="SPEC §2 and §4 define the shape; unknown types must live under `x.`.",
             )
 
+        # --- the Exchange (SPEC §15) -----------------------------------------
+        self._check_exchange_event(etype, body, hub_authored)
+
         # --- type-specific planning (conflicts, locks) ------------------------
         pos = self._plan(ev, ev_actor, ctx)
 
@@ -834,6 +849,77 @@ class Hub:
 
         ctx.by_id[dedup_key] = pos
         return {"id": event_id, "pos": pos, "seq": None, "duplicate": False}
+
+    @staticmethod
+    def _check_exchange_event(etype: str, body: dict, hub_authored: bool) -> None:
+        """Validate the Exchange events the Hub must not take on trust (SPEC §15).
+
+        Two things are checked, and both of them are things the Hub is the only
+        party able to check.
+
+        ``capability.announce`` is validated entry by entry with
+        :meth:`parley.exchange.Capability.validate`.  The registry would quietly
+        drop a malformed capability and carry on -- correct for a *reader* of the
+        log, wrong for the ingest point, because the announcing agent would then
+        believe it had lent something it had not.  A provider that publishes a
+        broken catalogue finds out here, with the problems named, instead of when
+        somebody tries to call it.
+
+        ``request.taken`` and ``request.expired`` are Hub-authored.  An agent that
+        could forge ``request.expired`` could charge a rival the SPEC §9
+        abandonment penalty -- the Ledger's only negative term -- for work the
+        rival never dropped.
+        """
+        if not hub_authored and etype in HUB_AUTHORED_TYPES:
+            raise BadEvent(
+                "%s is authored by the Hub, not by an agent" % etype,
+                detail={"type": etype},
+                hint="The Hub emits request.taken and request.expired itself from the "
+                "request state machine (SPEC §15.3). A provider ends a request with "
+                "request.result or request.decline.",
+            )
+        if etype != "capability.announce":
+            return
+        caps = body.get("capabilities")
+        if not isinstance(caps, list):
+            raise BadEvent(
+                "capability.announce needs a `capabilities` list",
+                hint='Send {"capabilities": [ {...}, ... ]}. An empty list is how an '
+                "agent withdraws its whole catalogue (announce is total, SPEC §15.1).",
+            )
+        if len(caps) > MAX_ANNOUNCED_CAPABILITIES:
+            raise TooLarge(
+                "too many capabilities in one announcement",
+                detail={"count": len(caps), "max": MAX_ANNOUNCED_CAPABILITIES},
+                hint="Announce the %d another agent would plausibly choose between."
+                % MAX_ANNOUNCED_CAPABILITIES,
+            )
+        problems: List[str] = []
+        seen: Dict[str, int] = {}
+        for index, raw in enumerate(caps):
+            if not isinstance(raw, dict):
+                problems.append("capabilities[%d] is not an object" % index)
+                continue
+            cap = Capability.from_dict(raw)
+            for problem in cap.validate():
+                problems.append("capabilities[%d]: %s" % (index, problem))
+            if cap.name:
+                if cap.name in seen:
+                    problems.append(
+                        "capabilities[%d]: %r was already announced at index %d; "
+                        "`name` is unique per agent (SPEC §15.1)"
+                        % (index, cap.name, seen[cap.name])
+                    )
+                seen[cap.name] = index
+        if problems:
+            raise BadEvent(
+                "capability.announce is not well-formed",
+                detail={"problems": problems[:8], "count": len(problems)},
+                hint="SPEC §15.1 has the field table. `description` is the one that "
+                "decides whether anybody uses the capability, and `safety` is the one "
+                "it is worst to get wrong -- an unrecognised value is treated as "
+                "dangerous. Nothing in this announcement was registered.",
+            )
 
     @staticmethod
     def _normalise_event_paths(etype: str, body: dict) -> None:
@@ -1203,6 +1289,71 @@ class Hub:
             except ParleyError:
                 log.exception("could not resolve decision %s", did)
 
+    # -------------------------------------------------------------- exchange
+
+    def _drain_taken(self) -> List[dict]:
+        """Hub-author `request.taken` for the losers of a `to: "any"` race (§15.3).
+
+        Driven straight off the append path rather than off the reaper: the race
+        is decided by an ``request.accept`` that has just been appended, and an
+        agent still deliberating on work somebody else already took is doing
+        wasted work for however long it takes to tell it.  ``_append_lock`` is
+        re-entrant, so the nested append this makes is the same serialised path
+        as any other -- and the ``request.taken`` it appends drains nothing
+        further, so the recursion is one level deep.
+        """
+        out: List[dict] = []
+        try:
+            owed = self.view.due_taken()
+        except Exception:
+            log.exception("could not read the pending request.taken events")
+            return out
+        for partial in owed:
+            try:
+                stored = self.hub_event("request.taken", dict(partial.get("body") or {}))
+            except ParleyError:
+                log.exception("could not emit request.taken for %s",
+                              (partial.get("body") or {}).get("id"))
+                continue
+            if stored:
+                out.append(stored)
+        return out
+
+    def sweep_exchange(self, now: "Optional[float]" = None) -> List[dict]:
+        """Hub-author every `request.expired` that is due (SPEC §15.3).
+
+        Called from the reaper tick, and directly by the tests and by `parley
+        doctor`, so expiry never needs a thread of its own.  SPEC §15.3 calls
+        dropping an accepted request the one unforgivable Exchange behaviour and
+        §9 makes this event the *sole* trigger for the Ledger's abandonment
+        penalty: an expiry that never fires is a provider never held to what it
+        accepted, so this runs whether or not anybody is appending.
+        """
+        when = time.time() if now is None else float(now)
+        out: List[dict] = []
+        try:
+            due = self.view.due_expiries(when)
+        except Exception:
+            log.exception("could not read the due request expiries")
+            return out
+        for partial in due:
+            body = dict(partial.get("body") or {})
+            try:
+                stored = self.hub_event("request.expired", body)
+            except ParleyError:
+                log.exception("could not expire request %s", body.get("id"))
+                continue
+            if stored:
+                log.info(
+                    "request %s expired after %ss (%s)",
+                    body.get("id"), body.get("timeout_s"),
+                    "accepted but never answered" if body.get("abandoned")
+                    else "nobody answered",
+                )
+                out.append(stored)
+        out.extend(self._drain_taken())
+        return out
+
     # --------------------------------------------------------------- reading
 
     def read_events(
@@ -1303,6 +1454,7 @@ class Hub:
                         "agent.offline", {"agent_id": agent_id, "reason": "timeout"}
                     )
                 self._resolve_due_decisions(now)
+                self.sweep_exchange(now)
             except Exception:
                 log.exception("reaper tick failed")
 
