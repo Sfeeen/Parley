@@ -374,6 +374,141 @@ def load_weights(workspace: Path) -> dict    # .parley/ledger.json over DEFAULT_
 `compute` must be **pure** (no I/O, no clock beyond an injected `computed_at`) so it is trivially
 testable and so the Hub can recompute it incrementally.
 
+## `parley/exchange.py`  — the Exchange, pure logic (SPEC §15)
+
+No I/O, no clock reads beyond injected `now`. The hub, the client and the tests all share this.
+
+```python
+SAFETY_LEVELS = ("safe", "guarded", "dangerous")
+CAPABILITY_KINDS = ("skill", "mcp", "hardware", "tool", "data", "compute", "human")
+DECLINE_CODES = ("unknown_capability", "bad_input", "policy", "busy", "unsafe",
+                 "offline", "needs_human", "cancelled", "other")
+REQUEST_STATES = ("pending", "accepted", "done", "failed", "declined", "expired", "cancelled")
+
+@dataclass
+class Capability:
+    name: str; title: str; kind: str; description: str
+    input_schema: dict | None = None; output: str = "text"
+    safety: str = "guarded"; cost: str = "moderate"; concurrency: int = 1
+    exclusive: bool = False; avg_duration_s: float = 0.0; examples: list = field(default_factory=list)
+    agent_id: str = ""; agent_name: str = ""
+    def to_dict(self) -> dict
+    @classmethod
+    def from_dict(cls, d: dict) -> "Capability"
+    def validate(self) -> list[str]        # [] when the announcement is well-formed
+
+class Registry:
+    """Merged capability catalogue across all agents. announce() is total per agent."""
+    def announce(self, agent_id: str, agent_name: str, caps: list[dict]) -> None
+    def revoke(self, agent_id: str, names: list[str]) -> None
+    def drop_agent(self, agent_id: str) -> None
+    def find(self, name: str, *, agent_id: str = "") -> list[Capability]
+    def all(self) -> list[Capability]
+    def to_dict(self, *, online: Mapping[str, bool] | None = None,
+                in_flight: Mapping[str, int] | None = None) -> dict
+
+def validate_input(schema: dict | None, value) -> list[str]
+    """JSON-Schema subset validator: type, properties, required, enum, minimum, maximum,
+       items, additionalProperties. Returns [] when valid. Must never raise on a hostile schema
+       or a deeply-nested/recursive value -- bound the depth."""
+
+@dataclass
+class Policy:
+    default: str = "ask"; auto_accept_safe: bool = True
+    rules: list = field(default_factory=list); max_in_flight: int = 4
+    max_per_requester_per_hour: int = 60; require_reason: bool = True
+    never_auto_accept: list = field(default_factory=lambda: ["dangerous"])
+    @classmethod
+    def load(cls, workspace: Path) -> "Policy"       # .parley/policy.json, safe defaults if absent
+    def save(self, workspace: Path) -> None
+    def decide(self, *, requester: str, capability: Capability | None,
+               is_instruction: bool, in_flight: int, recent_from_requester: int,
+               has_reason: bool) -> tuple[str, str]
+        """-> (action, why) where action is "allow" | "ask" | "deny".
+           MUST enforce SPEC §15.4: dangerous is never "allow"; a free-form instruction is never
+           treated as safe; unknown requester gets at most safe capabilities; first matching rule
+           wins. `why` is a human-readable sentence shown to the operator and used as the
+           decline reason, and must never leak policy internals that are not the requester's
+           business."""
+
+class RequestTracker:
+    """The §15.3 state machine, driven by events. Used by hub StateView and client runtime."""
+    def apply(self, event: dict, *, now: float) -> None
+    def expire_due(self, now: float) -> list[dict]     # -> request.expired events to emit
+    def state_of(self, req_id: str) -> str
+    def get(self, req_id: str) -> dict | None
+    def in_flight_for(self, agent_id: str) -> int
+    def addressed_to(self, agent_id: str, *, states: tuple = ("pending", "accepted")) -> list[dict]
+    def to_dict(self) -> dict
+    # record shape: {"id","from","to","capability"|None,"instruction"|None,"input","reason",
+    #                "state","created_ts","accepted_ts","eta_s","timeout_s","priority",
+    #                "progress","note","result","error","duration_s","seq"}
+
+def make_request(from_agent: str, to: str, *, capability: str = "", instruction: str = "",
+                 input: dict | None = None, reason: str, timeout_s: int = 300,
+                 priority: int = 3, expects: str = "text", refs=None) -> dict
+    """Builds a validated request.create body. Raises BadEvent if neither/both of
+       capability and instruction are given, or if reason is empty."""
+```
+
+## `parley/client/exchange.py` — the provider runtime
+
+```python
+Handler = Callable[[dict, dict], Any]
+    # (input, request_record) -> output. May raise; the runtime converts that into
+    # request.result{ok:false}. A handler returning a (output, output_text) tuple sets both.
+
+class Provider:
+    """Announces this agent's capabilities and executes delegated work under the local policy."""
+    def __init__(self, client: ParleyClient, workspace: Path, *,
+                 policy: Policy | None = None) -> None
+    def register(self, cap: Capability, handler: Handler | None = None) -> None
+        """handler=None means this capability is fulfilled manually -- the runtime surfaces the
+           request to the operator/agent via .parley/requests.json and `parley fulfil`."""
+    def register_from_file(self, path: Path) -> int       # .parley/capabilities.json
+    def announce(self) -> dict
+    def revoke(self, names: list[str]) -> dict
+    def on_event(self, event: dict) -> None               # routes request.* addressed to me
+    def pump(self, now: float) -> None                    # timeouts, queued work, pending expiry
+    def accept(self, req_id: str, eta_s: float = 0) -> dict
+    def decline(self, req_id: str, reason: str, code: str = "policy") -> dict
+    def fulfil(self, req_id: str, *, output=None, output_text: str = "",
+               files: list[str] | None = None, ok: bool = True, error: dict | None = None) -> dict
+    @property
+    def pending_consent(self) -> list[dict]
+
+class Requester:
+    """The calling side."""
+    def __init__(self, client: ParleyClient) -> None
+    def ask(self, to: str, capability: str, input: dict, *, reason: str,
+            timeout_s: int = 300, priority: int = 3) -> str          # -> req_id
+    def instruct(self, to: str, instruction: str, *, reason: str,
+                 timeout_s: int = 600, expects: str = "text") -> str
+    def wait(self, req_id: str, *, timeout_s: float | None = None) -> dict
+        """Blocks on the event stream until terminal. Returns the request record. Sets the
+           caller's PSR to waiting/blocked_on for the duration, and restores it afterwards."""
+    def cancel(self, req_id: str, reason: str = "") -> dict
+```
+
+Handlers execute in a bounded worker pool owned by `Runtime`, never on the stream thread. A
+handler that hangs must not wedge the agent: enforce `timeout_s` and emit a failed result.
+
+### StateView snapshot additions (hub)
+
+```
+"capabilities": <Registry.to_dict(online=…, in_flight=…)>,
+"requests": {"in_flight": [<record>, …], "recent": [<record>, …],
+             "counts": {"pending": n, "accepted": n, "done": n, "failed": n,
+                        "declined": n, "expired": n}}
+```
+and `graph.edges[].kinds` gains `"delegation": n`.
+
+### Ledger additions
+
+`LedgerLine.components` gains `"service"`, and `evidence` gains a `"service"` list. Negative
+service points from abandoned requests appear as their own evidence entries with a clear label —
+a penalty the user cannot trace would violate SPEC R6.
+
 ## `parley/cli.py`
 ```python
 def main(argv: list[str] | None = None) -> int
