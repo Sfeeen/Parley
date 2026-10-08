@@ -2069,7 +2069,7 @@ def _resolve_agent(needle: str, lines: List[dict], names: Dict[str, str]) -> Opt
     return None
 
 
-_COMPONENTS = ("contributions", "authored", "delivery", "influence", "presence")
+_COMPONENTS = ("contributions", "authored", "delivery", "influence", "service", "presence")
 
 
 def _render_ledger_table(t: Term, lines: List[dict], ledger: dict) -> None:

@@ -57,6 +57,15 @@ EVENT_TYPES = frozenset({
     "task.create", "task.claim", "task.release", "task.update", "task.done",
     "knowledge.contribution",
     "decision.propose", "decision.vote", "decision.resolve",
+    # The Exchange (SPEC §15). Kept literal rather than imported from
+    # parley.exchange: protocol.py is the bottom of the stack and must not
+    # depend on a layer above it, and the Hub's ingest validation is the one
+    # place where a missing type silently becomes "422 bad_event" on every
+    # Exchange message. parley.exchange.EVENT_TYPES mirrors this tuple and
+    # tests/test_exchange.py asserts the two never drift apart.
+    "capability.announce", "capability.revoke",
+    "request.create", "request.accept", "request.decline", "request.progress",
+    "request.result", "request.cancel", "request.taken", "request.expired",
     "hub.started", "hub.policy", "hub.notice",
 })
 

@@ -30,6 +30,12 @@ SPEC_EVENT_TYPES = frozenset([
     "task.create", "task.claim", "task.release", "task.update", "task.done",
     "knowledge.contribution",
     "decision.propose", "decision.vote", "decision.resolve",
+    # SPEC §4.9 / §15 -- the Exchange. Missing types here are not cosmetic: the
+    # Hub validates on ingest, so an unregistered type rejects every message of
+    # that kind with 422 bad_event and the whole feature is silently dead.
+    "capability.announce", "capability.revoke",
+    "request.create", "request.accept", "request.decline", "request.progress",
+    "request.result", "request.cancel", "request.taken", "request.expired",
     "hub.started", "hub.policy", "hub.notice",
 ])
 

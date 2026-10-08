@@ -33,6 +33,7 @@
     ["authored", "Authored substance", "surviving lines in files this agent last wrote"],
     ["delivery", "Delivery", "tasks this agent claimed and finished"],
     ["influence", "Influence", "times another agent cited this agent's events"],
+    ["service", "Service", "work done for other agents through the Exchange, minus abandoned requests"],
     ["presence", "Presence", "chat messages, hard-capped so chattiness cannot win"]
   ];
 
